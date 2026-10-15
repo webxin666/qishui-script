@@ -57,7 +57,7 @@ def get_ocr():
     if ocr_engine is None:
         print("⏳ 加载 OCR 模型...")
         ocr_engine = RapidOCR()
-        print("✅ OCR 就绪")
+        print("✅ OCR 已就绪")
     return ocr_engine
 
 
