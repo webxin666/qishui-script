@@ -2,7 +2,7 @@
 
 适用 app 版本：`19.1.1`
 
-## 第一步：安装运行环境
+### 安装运行环境
 1. 安装 Python 3
 2. 安装依赖库
 ```bash
@@ -13,7 +13,7 @@ pip install -r requirements.txt
 pip3 install -r requirements.txt
 ```
 
-## 第二步：安卓手机打开ADB调试
+### 安卓手机打开ADB调试
 1. 设置页面，找到 「设置」 >「开发者选项」。
 2. 开启以下开关：
    - USB 调试（必须开启）
@@ -21,16 +21,15 @@ pip3 install -r requirements.txt
 3. 通过数据线把手机连接到电脑，手机弹窗勾选允许调试。
 
 
-## 第三步：开始使用
+### 开始使用
 1. 手机打开 汽水音乐，进入看广告领时长页面（保持屏幕常亮）。
 2. 在命令行运行
 ```bash
 # Windows（也可以直接双击 启动.bat）
-python qishui_auto.py
+python qishui_script
 
 # Mac
-python3 qishui_auto.py
+python3 qishui_script
 ```
 3. 控制台显示 `✅ OCR 已就绪` 后，脚本开始自动运行。
-
 

@@ -32,7 +32,7 @@ CENTER_TARGETS = {"领取奖励", "继续观看"}
 # 截图过大时缩小再 OCR，加快速度（坐标会按比例还原）
 OCR_MAX_WIDTH = 720
 # 每次点击保存标注截图，方便排查误点
-SAVE_CLICK_DEBUG = False
+SAVE_CLICK_DEBUG = True
 # adb 命令超时（秒），防止手机断开时卡死
 ADB_TIMEOUT = 10
 # 防连点：同一目标在同一位置 REPEAT_WINDOW 秒内已点了 REPEAT_LIMIT 次还在，
@@ -45,7 +45,7 @@ REPEAT_TOL = 0.03
 # ===========================================
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DEBUG_DIR = os.path.join(SCRIPT_DIR, "debug_clicks")
+DEBUG_DIR = os.path.join(SCRIPT_DIR, "debug_images")
 ocr_engine = None
 click_seq = 0
 recent_clicks = []  # [(时间戳, target, x, y)]，用于防连点
