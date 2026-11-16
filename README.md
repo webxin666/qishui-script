@@ -26,10 +26,10 @@ pip3 install -r requirements.txt
 2. 在命令行运行
 ```bash
 # Windows（也可以直接双击 启动.bat）
-python qishui_script
+python qishui_script.py
 
 # Mac
-python3 qishui_script
+python3 qishui_script.py
 ```
 3. 控制台显示 `✅ OCR 已就绪` 后，脚本开始自动运行。
 
