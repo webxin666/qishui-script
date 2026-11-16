@@ -43,6 +43,13 @@ REPEAT_LIMIT = 4
 REPEAT_PAUSE = 30.0
 # 判定「同一位置」的容差（相对屏幕宽度）
 REPEAT_TOL = 0.03
+# 误入直播间：命中至少 LIVE_MIN_HITS 个特征词就点右上角 × 退出
+LIVE_KEYWORDS = ["说点什么", "更多直播", "小时榜", "本场点赞", "欢迎来到直播间"]
+LIVE_MIN_HITS = 2
+# OCR 没认出 × 时按这个相对位置点（1080x2400 实测）
+LIVE_CLOSE_POS = (0.944, 0.074)
+# 连续点 × 这么多次仍在直播间，改按返回键
+LIVE_BACK_AFTER = 3
 # ===========================================
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -51,6 +58,8 @@ ocr_engine = None
 click_seq = 0
 recent_clicks = []  # [(时间戳, target, x, y)]，用于防连点
 paused_until = {}   # target -> 恢复点击的时间戳
+LIVE_TARGET = "直播间×"
+live_close_tries = 0  # 连续尝试退出直播间的次数
 
 
 def get_ocr():
@@ -291,8 +300,47 @@ def find_and_click(screen):
         recent_clicks.append((time.time(), target, x, y))
         return target
 
+    live = find_live_close(items, sw, sh)
+    if live:
+        return close_live(screen, *live)
+
     print("· 未找到:", " / ".join(TARGETS))
     return None
+
+
+def find_live_close(items, sw, sh):
+    """判断是否误入直播间：是则返回右上角 × 的 (x, y, score, 说明)，否则返回 None"""
+    texts = [normalize_text(t) for t, _, _, _ in items]
+    # 广告页顶部是「N秒后可领取奖励 ×」，点那个 × 会提前关广告，不能当成直播间
+    if any("领取奖励" in t for t in texts):
+        return None
+    hits = [k for k in LIVE_KEYWORDS if any(k in t for t in texts)]
+    if len(hits) < LIVE_MIN_HITS:
+        return None
+    # 优先用 OCR 认出来的右上角 ×
+    marks = [
+        (cx, cy, score) for t, score, cx, cy in items
+        if t.strip() in ("X", "x", "×", "✕", "✖") and cx > sw * 0.85 and cy < sh * 0.15
+    ]
+    if marks:
+        cx, cy, score = max(marks)
+        return int(cx), int(cy), score, f"OCR 识别到 ×，特征词 {hits}"
+    x, y = LIVE_CLOSE_POS
+    return int(sw * x), int(sh * y), 0.0, f"按固定位置点 ×，特征词 {hits}"
+
+
+def close_live(screen, x, y, score, how):
+    global live_close_tries
+    live_close_tries += 1
+    print(f"📺 进入直播间了（{how}），第 {live_close_tries} 次尝试退出")
+    if live_close_tries > LIVE_BACK_AFTER:
+        print(f"↩ 已点 {LIVE_BACK_AFTER} 次 × 仍在直播间，改按返回键")
+        adb_command(["shell", "input", "keyevent", "4"])
+        live_close_tries = 0
+        return LIVE_TARGET
+    log_click(screen, LIVE_TARGET, "×", score, x, y, [(score, x, y, "×")])
+    adb_command(["shell", "input", "tap", str(x), str(y)])
+    return LIVE_TARGET
 
 
 # 点完这些目标后不进入冷却，立刻下一轮识别
@@ -312,6 +360,8 @@ while True:
             continue
 
         clicked = find_and_click(screen)
+        if clicked != LIVE_TARGET:
+            live_close_tries = 0
         if clicked:
             if clicked in NO_COOLDOWN_TARGETS:
                 print(f"⚡ 「{clicked}」已点，跳过等待，立即继续识别")
