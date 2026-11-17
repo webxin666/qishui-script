@@ -1,3 +1,8 @@
+import base64
+import hashlib
+import hmac
+import json
+import urllib.request
 import cv2
 import numpy as np
 import subprocess
@@ -9,9 +14,14 @@ from datetime import datetime
 
 from rapidocr_onnxruntime import RapidOCR
 
-# 抖音商城看广告领金币 · 线一：金币购物抵钱 → 做任务赚金币 → 看广告视频
-# 启动时停在「做任务赚金币」弹层（读出 N/M 次，看到 M 次就停）或者直接停在广告页都行
-# 离线调试：python store_activity.py --dry 截图1.png 截图2.png（只打印页面判断，不点击）
+# 飞书机器人地址和密钥放在 store_config.py（不提交 git），没有这个文件就只打日志不发通知
+try:
+    from store_config import FEISHU_WEBHOOK, FEISHU_SECRET
+except ImportError:
+    FEISHU_WEBHOOK, FEISHU_SECRET = "", ""
+
+# 抖音商城看广告脚本的公共部分：adb / OCR / 文字匹配、广告页（倒计时、领取成功）、跳直播间、
+# 折扣券通知、任务列表、计数和主循环。每条线的脚本只写自己的页面，启动前调用 setup()
 
 # ================== 配置区 ==================
 # 置信度下限
@@ -23,23 +33,24 @@ CLICK_COOLDOWN = 2.0
 # 广告倒计时期间的轮询间隔：中途可能弹出只停 3 秒的「进入直播间」提示，所以不额外等
 COUNTDOWN_POLL = 0.0
 # 各目标所在区域（相对屏幕宽高 0~1），按截图估的，跑起来以调试截图为准再调
+# 这里是广告页通用的，各条线用 setup() 补上自己页面的
 TARGET_ROI = {
     "进入直播间": {"x": (0.20, 0.80), "y": (0.55, 0.80)},  # 「3s后进入直播间 | 取消」提示条
-    "继续领奖励": {"x": (0.25, 0.75), "y": (0.45, 0.70)},  # 弹窗按钮
     "领取成功": {"x": (0.60, 1.0), "y": (0.0, 0.12)},      # 倒计时结束后的右上角
     "可领奖励": {"x": (0.50, 1.0), "y": (0.0, 0.12)},      # 右上角「27s后可领奖励」
-    "去看看": {"x": (0.70, 1.0), "y": (0.0, 1.0)},         # 任务列表右侧按钮列
 }
-# 点击目标：识别出的文字比目标词长 2 个字以上就不算，排除「再看一个视频继续领奖励」这类标题
-STRICT_TARGETS = {"继续领奖励", "领取成功", "去看看"}
-# 任务列表里「去看看」和「看广告视频」算同一行的高度容差（相对屏幕高度）
+# 点击目标：识别出的文字比目标词长 2 个字以上就不算，排除标题里顺带包含目标词的情况
+STRICT_TARGETS = {"领取成功"}
+# 任务列表里按钮和任务标题算同一行的高度容差（相对屏幕高度）
 ROW_TOL = 0.03
 # 新广告开始后这么多秒内认出的「领取成功」，当成上一个广告还没消失的残影，不计数也不点
 MIN_AD_SECONDS = 5.0
 # 连续这么多轮认不出页面，按一次返回键
 UNKNOWN_BACK_AFTER = 10
-# 任务列表里读不到次数/「去看看」时最多重试这么多轮
+# 列表页里读不到次数/按钮时最多重试这么多轮
 LIST_TRIES = 3
+# 任务按钮变成「01:50」这种冷却倒计时期间，最多隔这么多秒再截图看一次
+COOLDOWN_CHECK = 30
 # 截图过大时缩小再 OCR，加快速度（坐标会按比例还原）
 OCR_MAX_WIDTH = 720
 # 每次点击保存标注截图，方便排查误点
@@ -68,9 +79,8 @@ COUPON_Y_MIN = 0.70
 COUPON_MAX_DISCOUNT = None
 # ===========================================
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DEBUG_DIR = os.path.join(SCRIPT_DIR, "debug_images_activity")
-COUPON_DIR = os.path.join(DEBUG_DIR, "coupon")
+DEBUG_DIR = None      # 由各条线 setup() 设置
+COUPON_DIR = None
 ocr_engine = None
 click_seq = 0
 recent_clicks = []  # [(时间戳, target, x, y)]，用于防连点
@@ -79,19 +89,27 @@ LIVE_TARGET = "直播间×"
 live_close_tries = 0  # 连续尝试退出直播间的次数
 DRY_RUN = False       # --dry 时只打印要点哪里，不真点
 
-PAGE_NAMES = {
+COMMON_PAGE_NAMES = {
     "live_prompt": "进直播间提示",
-    "popup": "④ 继续弹窗",
-    "reward_done": "③ 广告结束",
-    "countdown": "② 广告播放中",
-    "task_list": "① 任务列表",
+    "reward_done": "广告结束",
+    "countdown": "广告播放中",
+    "task_list": "任务列表",
     "main_page": "金币购物抵钱主页",
     "live_room": "已进直播间",
     "unknown": "认不出",
 }
 
 
-# ---------------- 通用：adb / OCR / 文字匹配 ----------------
+def setup(debug_dir, roi=None, strict=()):
+    """各条线启动前调用：设置调试图目录，补上这条线自己的点击区域和点击目标"""
+    global DEBUG_DIR, COUPON_DIR
+    DEBUG_DIR = debug_dir
+    COUPON_DIR = os.path.join(debug_dir, "coupon")
+    TARGET_ROI.update(roi or {})
+    STRICT_TARGETS.update(strict)
+
+
+# ---------------- adb / OCR / 文字匹配 ----------------
 
 def get_ocr():
     global ocr_engine
@@ -251,13 +269,14 @@ def log_click(screen, target, text, score, x, y, candidates):
     print()
 
 
-def tap(screen, target, text, score, x, y, candidates=None):
-    """点击并记录；该目标正被防连点暂停时不点，返回 False"""
+def tap(screen, target, text, score, x, y, candidates=None, guard=True):
+    """点击并记录；guard=True 时走防连点，该目标正被暂停就不点，返回 False"""
     sh, sw = screen.shape[:2]
-    if time.time() < paused_until.get(target, 0):
-        return False
-    if should_pause(target, x, y, sw):
-        return False
+    if guard:
+        if time.time() < paused_until.get(target, 0):
+            return False
+        if should_pause(target, x, y, sw):
+            return False
     if DRY_RUN:
         px, py = pos_pct(x, y, sw, sh)
         print(f"   [dry] 会点「{target}」 OCR=「{text}」 @({x},{y}) ~({px:.1f}%,{py:.1f}%)")
@@ -316,7 +335,7 @@ def ocr_preview(items):
     )
 
 
-# ---------------- 通用：广告跳直播间 ----------------
+# ---------------- 广告跳直播间 ----------------
 
 def find_live_cancel(items, prompt, sw, sh):
     """「3s后进入直播间 | 取消」：返回「取消」的点击坐标；这条提示没有「取消」时返回 None"""
@@ -378,16 +397,16 @@ def close_live(screen, x, y, score, how):
     tap(screen, LIVE_TARGET, "×", score, x, y)
 
 
-# ---------------- 通用：折扣券飞书通知 ----------------
+# ---------------- 折扣券飞书通知 ----------------
 
 def find_coupon(items, sw, sh):
     """广告底部商品卡里的折扣券：返回 {discount, limit, name, coins}，没有返回 None"""
-    labels = [(cx, cy) for t, _, cx, cy, _ in items if "折扣券" in normalize_text(t) and cy > COUPON_Y_MIN * sh]
+    labels = [(t, cx, cy) for t, _, cx, cy, _ in items if "折扣券" in normalize_text(t) and cy > COUPON_Y_MIN * sh]
     if not labels:
         return None
-    lx, ly = labels[0]
-    # 「折扣券」正下方那张卡片：6折、最多抵50元
-    card = [t for t, _, cx, cy, _ in items if abs(cx - lx) < 0.12 * sw and ly < cy <= ly + 0.08 * sh]
+    lt, lx, ly = labels[0]
+    # 两种版式：折扣和「折扣券」连成一行「折扣券6.5折」；或者「折扣券」三个字正下方一张卡片写「6折」「最多抵50元」
+    card = [lt] + [t for t, _, cx, cy, _ in items if abs(cx - lx) < 0.12 * sw and ly < cy <= ly + 0.08 * sh]
     discount = None
     for t in card:
         m = re.search(r"(\d+(?:\.\d+)?)\s*折", t)
@@ -416,10 +435,35 @@ def find_coupon(items, sw, sh):
 
 
 def notify(text, image_path):
-    """发飞书通知。接入方式还没定，先只打日志、存截图；定了以后只改这个函数"""
+    """打日志，并通过飞书群的自定义机器人发一条文字通知。
+    自定义机器人发不了本地图片，截图只附本机路径"""
     print()
     print("🔔 " + text.replace("\n", "\n   "))
     print(f"   截图: {image_path}")
+    if DRY_RUN or not FEISHU_WEBHOOK:
+        print("   （没配置飞书机器人，或者是 --dry，只打日志）")
+        print()
+        return
+    body = {"msg_type": "text", "content": {"text": f"{text}\n截图：{image_path}"}}
+    if FEISHU_SECRET:
+        # 签名校验：用「时间戳\n密钥」做 HmacSHA256 的 key，对空串签名再 base64
+        ts = str(int(time.time()))
+        key = f"{ts}\n{FEISHU_SECRET}".encode("utf-8")
+        body["timestamp"] = ts
+        body["sign"] = base64.b64encode(hmac.new(key, digestmod=hashlib.sha256).digest()).decode("utf-8")
+    try:
+        req = urllib.request.Request(
+            FEISHU_WEBHOOK, data=json.dumps(body).encode("utf-8"), headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+        if result.get("code", 0) == 0:
+            print("   已发飞书通知")
+        else:
+            print(f"⚠️ 飞书通知发送失败: {result}")
+    except Exception as e:
+        # 通知发不出去不影响看广告
+        print(f"⚠️ 飞书通知发送失败: {e}")
     print()
 
 
@@ -442,7 +486,7 @@ def check_coupon(screen, items, progress):
         cv2.imwrite(path, screen)
     lines = [
         "抖音商城出现折扣券",
-        f"折扣：{d + '折' if d else '未识别'}，最多抵 {coupon['limit'] + '元' if coupon['limit'] else '未识别'}",
+        f"折扣：{d + '折' if d else '未识别'}" + (f"，最多抵 {coupon['limit']}元" if coupon["limit"] else ""),
         f"商品：{coupon['name'] or '未识别'}",
     ]
     if coupon["coins"]:
@@ -452,13 +496,16 @@ def check_coupon(screen, items, progress):
     return True
 
 
-# ---------------- 线一：看广告视频 ----------------
+# ---------------- 计数 ----------------
 
 class AdState:
-    """线一的计数和状态。脚本自己数，不回任务列表确认"""
+    """一条线的计数和状态。进度以页面上读到的数字为准，读到之后再自己往上数"""
 
-    def __init__(self):
-        self.base = 0           # 最近一次从任务列表读到的 N
+    def __init__(self, name, unit="次", verb=""):
+        self.name = name        # 任务名，如「看广告视频」
+        self.unit = unit
+        self.verb = verb        # 进度前缀，如「已拆 」
+        self.base = 0           # 最近一次从页面上读到的已完成次数 N
         self.total = 0          # M；0 表示还没读到（直接从广告页启动）
         self.watched = 0        # 读到 N 之后又看完几个
         self.in_ad = False      # 启动后是否已经进过广告
@@ -467,19 +514,21 @@ class AdState:
         self.coupon_done = False
         self.list_misses = 0
         self.unknown_rounds = 0
+        # 最后一个广告看完后，是否也点「领取成功」退出广告再停（线二要回到拆红包页）
+        self.close_last_ad = False
 
     @property
     def progress(self):
         return self.base + self.watched
 
     def progress_text(self):
-        """和任务列表上的写法一致，N 是已经看完的次数"""
+        """和页面上的写法一致，N 是已经完成的次数"""
         if self.total:
-            return f"看广告视频 {self.progress}/{self.total}次"
-        return "看广告视频 次数没读到（直接从广告页启动，回到任务列表才能读到）"
+            return f"{self.name} {self.verb}{self.progress}/{self.total}{self.unit}"
+        return f"{self.name} 进度没读到（直接从广告页启动，回到列表页才能读到）"
 
     def finished(self):
-        # 直接从广告页启动、没读到任务进度时不按个数停，回到任务列表读到次数再判断
+        # 直接从广告页启动、没读到进度时不按个数停，回到列表页读到次数再判断
         return self.total > 0 and self.progress >= self.total
 
     def sync(self, done, total):
@@ -494,8 +543,10 @@ class AdState:
         print(f"▶ {'从广告页启动，接着看' if resumed else '开始看'}：{self.progress_text()}")
 
 
-def parse_progress(items, row_y, sh):
-    """读「看广告视频」下面那行「金币今日最高+6000，0/10次」里的 (N, M)"""
+# ---------------- 任务列表 ----------------
+
+def parse_row_progress(items, row_y, sh):
+    """读任务标题下面那行的 (N, M)，如「金币今日最高+6000，0/10次」「今天已拆0/10」"""
     for t, _, _, cy, _ in sorted(items, key=lambda i: i[3]):
         if not (row_y < cy <= row_y + 0.045 * sh):
             continue
@@ -512,26 +563,59 @@ def parse_progress(items, row_y, sh):
     return None
 
 
-def find_ad_row(items, sw, sh):
-    """任务列表里「看广告视频」这一行：返回 (行 y, 去看看按钮或 None, (N, M) 或 None)"""
-    titles = [cy for t, _, _, cy, _ in items if text_match(t, "看广告视频")]
+def find_task_row(items, sw, sh, title, button):
+    """「做任务赚金币」列表里的一行：返回 (行 y, 按钮或 None, (N, M) 或 None, 冷却剩余秒数或 None)"""
+    titles = [cy for t, _, _, cy, _ in items if text_match(t, title)]
     if not titles:
         return None
     row_y = titles[0]
-    # 右边那列按钮长得都差不多，按行找「去看看」，不在整屏里找
-    buttons = [c for c in find_targets(items, "去看看", sw, sh) if abs(c[2] - row_y) <= ROW_TOL * sh]
-    return row_y, (buttons[0] if buttons else None), parse_progress(items, row_y, sh)
+    # 右边那列按钮长得都差不多，按行找，不在整屏里找
+    buttons = [c for c in find_targets(items, button, sw, sh) if abs(c[2] - row_y) <= ROW_TOL * sh]
+    # 做到一定次数后，按钮会变成「01:50」这种冷却倒计时
+    cooldown = None
+    for t, _, cx, cy, _ in items:
+        m = re.fullmatch(r"(\d{1,2})\s*[:：]\s*(\d{2})", t.strip())
+        if m and cx > 0.70 * sw and abs(cy - row_y) <= ROW_TOL * sh:
+            cooldown = int(m.group(1)) * 60 + int(m.group(2))
+            break
+    return row_y, (buttons[0] if buttons else None), parse_row_progress(items, row_y, sh), cooldown
 
 
-def detect_page(items, sw, sh):
-    """按优先级认页面：通用的进直播间提示最先，线一的页面居中，已进直播间和认不出最后"""
+def handle_task_list(screen, data, state, button_name, enters_ad=True):
+    """任务列表：读次数，满了停；按钮是冷却倒计时就等；否则点这一行的按钮"""
+    _, button, progress, cooldown = data
+    if progress:
+        state.sync(*progress)
+        print(f"📋 读到任务列表：{state.progress_text()}")
+        if state.finished():
+            print("今天的次数已经满了")
+            return None
+    if progress and button is None and cooldown is not None:
+        state.list_misses = 0
+        print(f"⏳ {state.name}冷却中，还要 {cooldown // 60:02d}:{cooldown % 60:02d}，等它走完再点「{button_name}」")
+        return min(cooldown + 1, COOLDOWN_CHECK)
+    if progress is None or button is None:
+        state.list_misses += 1
+        what = "次数" if progress is None else f"「{button_name}」"
+        print(f"⚠️ 任务列表里没认出{what}（{state.list_misses}/{LIST_TRIES}）")
+        return None if state.list_misses >= LIST_TRIES else POLL_INTERVAL
+    state.list_misses = 0
+    score, cx, cy, text, _ = button
+    if tap(screen, button_name, text, score, int(cx), int(cy)) and enters_ad:
+        state.new_ad()
+    return CLICK_COOLDOWN
+
+
+# ---------------- 页面识别和处理 ----------------
+
+def detect_live_prompt(items, sw, sh):
+    """通用页面里最先判断：进直播间提示出现时倒计时还在，只停 3 秒"""
     prompt = find_live_prompt(items, sw, sh)
-    if prompt:
-        return "live_prompt", prompt
-    # 弹窗盖在广告上时，底下变暗的「领取成功」还认得出来，所以弹窗要先判
-    hits = find_targets(items, "继续领奖励", sw, sh)
-    if hits:
-        return "popup", hits
+    return ("live_prompt", prompt) if prompt else None
+
+
+def detect_ad(items, sw, sh):
+    """广告页：右上角「领取成功」或「Ns后可领奖励」"""
     hits = find_targets(items, "领取成功", sw, sh)
     if hits:
         return "reward_done", hits
@@ -539,9 +623,11 @@ def detect_page(items, sw, sh):
     for text, score, cx, cy, rect in items:
         if "可领奖励" in normalize_text(text) and in_roi(cx, cy, sw, sh, "可领奖励"):
             return "countdown", text
-    row = find_ad_row(items, sw, sh)
-    if row:
-        return "task_list", row
+    return None
+
+
+def detect_fallback(items, sw, sh):
+    """各条线自己的页面都没命中时：金币购物抵钱主页、已进直播间、认不出"""
     texts = [normalize_text(t) for t, _, _, _, _ in items]
     if any("金币购物抵钱" in t for t in texts) and not any("做任务赚金币" in t for t in texts):
         return "main_page", None
@@ -551,12 +637,9 @@ def detect_page(items, sw, sh):
     return "unknown", None
 
 
-def handle(screen, items, page, data, state):
-    """执行当前页面的动作，返回下一轮前要等的秒数；返回 None 表示停止脚本"""
-    sh, sw = screen.shape[:2]
-
-    # 没经过任务列表、直接停在广告页启动：接上正在放的这个广告
-    # （启动时停在弹窗的话，点「继续领奖励」本身就会开始新广告，不用接）
+def handle_common(screen, items, page, data, state):
+    """处理各条线都有的页面，返回下一轮前要等的秒数；返回 None 表示停止脚本"""
+    # 没经过列表页、直接停在广告页启动：接上正在放的这个广告
     if not state.in_ad and page in ("live_prompt", "countdown", "reward_done"):
         state.new_ad(resumed=True)
 
@@ -565,12 +648,6 @@ def handle(screen, items, page, data, state):
         print(f"📺 广告要跳直播间（{text}），点「取消」")
         tap(screen, "取消", text, score, x, y)
         return POLL_INTERVAL
-
-    if page == "popup":
-        score, cx, cy, text, _ = data[0]
-        if tap(screen, "继续领奖励", text, score, int(cx), int(cy), [c[:4] for c in data]):
-            state.new_ad()
-        return CLICK_COOLDOWN
 
     if page == "reward_done":
         if not state.counted and time.time() - state.ad_started < MIN_AD_SECONDS:
@@ -583,36 +660,20 @@ def handle(screen, items, page, data, state):
             state.counted = True
             state.watched += 1
             print(f"✅ 广告看完：{state.progress_text()}")
-        if state.finished():
-            return None
         score, cx, cy, text, _ = data[0]
+        if state.finished() and not state.close_last_ad:
+            return None
         tap(screen, "领取成功", text, score, int(cx), int(cy), [c[:4] for c in data])
+        if state.finished():
+            print("👋 最后一个也点了「领取成功」，退出广告")
+            return None
         return POLL_INTERVAL
 
     if page == "countdown":
         if not state.coupon_done:
             state.coupon_done = check_coupon(screen, items, state.progress_text())
-        print(f"· ② 广告播放中：{data}")
+        print(f"· 广告播放中：{data}")
         return COUNTDOWN_POLL
-
-    if page == "task_list":
-        _, button, progress = data
-        if progress:
-            state.sync(*progress)
-            print(f"📋 读到任务列表：{state.progress_text()}")
-            if state.finished():
-                print("今天的次数已经满了")
-                return None
-        if progress is None or button is None:
-            state.list_misses += 1
-            what = "次数" if progress is None else "「去看看」"
-            print(f"⚠️ 任务列表里没认出{what}（{state.list_misses}/{LIST_TRIES}）")
-            return None if state.list_misses >= LIST_TRIES else POLL_INTERVAL
-        state.list_misses = 0
-        score, cx, cy, text, _ = button
-        if tap(screen, "去看看", text, score, int(cx), int(cy)):
-            state.new_ad()
-        return CLICK_COOLDOWN
 
     if page == "main_page":
         print("⚠️ 「做任务赚金币」弹层被关了，在金币购物抵钱主页按返回键会直接退出，停止脚本")
@@ -631,12 +692,13 @@ def handle(screen, items, page, data, state):
     return POLL_INTERVAL
 
 
-def run():
+# ---------------- 主循环 ----------------
+
+def run(title, detect_page, handle, state):
     global live_close_tries
-    print("🚀 抖音商城看广告脚本启动 · 线一：做任务赚金币 → 看广告视频")
+    print(f"🚀 {title}")
     print(f"   置信度>={OCR_SCORE}  轮询={POLL_INTERVAL}s  倒计时轮询={COUNTDOWN_POLL}s")
     print(f"   点击调试图目录: {DEBUG_DIR}")
-    state = AdState()
 
     while True:
         try:
@@ -669,7 +731,7 @@ def run():
     print(f"🏁 停止脚本：{state.progress_text()}")
 
 
-def dry_run(paths):
+def dry_run(paths, detect_page, handle, make_state, page_names):
     """离线认截图：只打印每张图认成什么页面、会点哪里，不连手机"""
     global DRY_RUN
     DRY_RUN = True
@@ -681,15 +743,19 @@ def dry_run(paths):
         sh, sw = screen.shape[:2]
         items = run_ocr(screen)
         page, data = detect_page(items, sw, sh)
-        print(f"\n===== {os.path.basename(p)}  {sw}x{sh}  →  {PAGE_NAMES[page]}")
-        # 当成已经在看第 1 个广告、进度 0/10，只看这一帧会怎么处理
-        state = AdState()
+        print(f"\n===== {os.path.basename(p)}  {sw}x{sh}  →  {page_names.get(page, page)}")
+        # 当成已经在看广告、进度 0/10，只看这一帧会怎么处理
+        state = make_state()
         state.total, state.in_ad, state.counted = 10, True, False
         handle(screen, items, page, data, state)
 
 
-if __name__ == "__main__":
-    if len(sys.argv) > 2 and sys.argv[1] == "--dry":
-        dry_run(sys.argv[2:])
+def main(title, detect_page, handle, make_state, page_names):
+    """python 脚本.py 正常跑；python 脚本.py --dry 截图1.png 截图2.png 离线看页面判断；
+    python 脚本.py --notify-test 发一条测试消息，检查飞书机器人配好没有"""
+    if len(sys.argv) > 1 and sys.argv[1] == "--notify-test":
+        notify(f"抖音商城脚本：飞书通知测试\n时间：{datetime.now():%Y-%m-%d %H:%M:%S}", "(测试消息，没有截图)")
+    elif len(sys.argv) > 2 and sys.argv[1] == "--dry":
+        dry_run(sys.argv[2:], detect_page, handle, make_state, page_names)
     else:
-        run()
+        run(title, detect_page, handle, make_state())

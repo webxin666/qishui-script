@@ -2,3 +2,5 @@ debug_images/
 debug_images_activity/
 __pycache__/
 .DS_Store
+debug_images_red/
+douyin_store/store_config.py

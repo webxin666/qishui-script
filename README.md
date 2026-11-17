@@ -25,7 +25,7 @@ pip3 install -r requirements.txt
 1. 手机打开 汽水音乐，进入看广告领时长页面（保持屏幕常亮）。
 2. 在命令行运行
 ```bash
-# Windows（也可以直接双击 启动.bat）
+# Windows（也可以直接双击 windows启动汽水music.bat）
 python qishui_script.py
 
 # Mac
@@ -33,3 +33,17 @@ python3 qishui_script.py
 ```
 3. 控制台显示 `✅ OCR 已就绪` 后，脚本开始自动运行。
 
+
+
+
+## 抖音商城看广告领金币
+
+```bash
+# Windows
+windows启动store_activity.bat
+windows启动store_red.bat
+
+# Mac
+python3 douyin_store/script_activity.py
+python3 douyin_store/script_red.py
+```
