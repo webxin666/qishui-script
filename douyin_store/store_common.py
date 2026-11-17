@@ -47,9 +47,11 @@ STRICT_TARGETS = {"领取成功"}
 ROW_TOL = 0.03
 # 新广告开始后这么多秒内认出的「领取成功」，当成上一个广告还没消失的残影，不计数也不点
 MIN_AD_SECONDS = 5.0
-# 连续这么多轮（每轮截一次图）认不出页面，就按一次返回键并发飞书通知；中间认出任何页面就从 0 重新数
+# 每连续这么多轮（每轮截一次图）认不出页面，就按一次返回键；中间认出任何页面就从 0 重新数
 # 广告刚加载时会闪一两轮认不出，属于正常
-UNKNOWN_BACK_AFTER = 3
+UNKNOWN_BACK_AFTER = 10
+# 连续这么多轮认不出页面（中间按过返回键也没回到认识的页面），发飞书通知
+UNKNOWN_NOTIFY_AFTER = 10
 # 列表页里读不到次数/按钮时最多重试这么多轮
 LIST_TRIES = 3
 # 任务按钮变成「01:50」这种冷却倒计时期间，最多隔这么多秒再截图看一次
@@ -450,24 +452,47 @@ def close_live(screen, x, y, score, how):
 
 # ---------------- 折扣券飞书通知 ----------------
 
+def find_discount(texts):
+    """从几段文字里取折扣：「6.5折」；或者大字「6.5」和小字「折」被 OCR 拆开时，单独的那个数字"""
+    for t in texts:
+        m = re.search(r"(\d+(?:\.\d+)?)\s*折", t)
+        if m:
+            return m.group(1)
+    nums = [t.strip() for t in texts if re.fullmatch(r"\d+(\.\d+)?", t.strip())]
+    return nums[0] if nums else None
+
+
+def find_coupon_popup(items, sw, sh):
+    """广告中途弹出的「恭喜获得惊喜福利 / 恭喜获得折扣福利」弹窗，这时券已经发了，比底部商品卡出得早"""
+    titles = [cy for t, _, _, cy, _ in items if re.search(r"恭喜获得.*福利", normalize_text(t))]
+    if not titles:
+        return None
+    ty = titles[0]
+    # 弹窗里「6.5折」和「折扣券」在同一行，折扣在左边；只送金币、没有折扣券的弹窗不算
+    labels = [(cx, cy) for t, _, cx, cy, _ in items if "折扣券" in normalize_text(t) and ty < cy <= ty + 0.25 * sh]
+    if not labels:
+        return None
+    lx, ly = labels[0]
+    row = [t for t, _, cx, cy, _ in items if abs(cy - ly) <= 0.02 * sh and cx < lx]
+    # 首单返金币：标题和折扣券之间那一行的数字，如「5000 金币 首单最高可返」
+    coins = [t.strip() for t, _, _, cy, _ in items if ty < cy < ly - 0.01 * sh and re.fullmatch(r"\d{3,6}", t.strip())]
+    return {"source": "福利弹窗", "discount": find_discount(row), "limit": None, "name": None,
+            "coins": coins[0] if coins else None}
+
+
 def find_coupon(items, sw, sh):
-    """广告底部商品卡里的折扣券：返回 {discount, limit, name, coins}，没有返回 None"""
+    """折扣券：返回 {source, discount, limit, name, coins}，没有返回 None。
+    先看广告中途的福利弹窗（出得最早），没有再看广告底部商品卡"""
+    popup = find_coupon_popup(items, sw, sh)
+    if popup:
+        return popup
     labels = [(t, cx, cy) for t, _, cx, cy, _ in items if "折扣券" in normalize_text(t) and cy > COUPON_Y_MIN * sh]
     if not labels:
         return None
     lt, lx, ly = labels[0]
     # 两种版式：折扣和「折扣券」连成一行「折扣券6.5折」；或者「折扣券」三个字正下方一张卡片写「6折」「最多抵50元」
     card = [lt] + [t for t, _, cx, cy, _ in items if abs(cx - lx) < 0.12 * sw and ly < cy <= ly + 0.08 * sh]
-    discount = None
-    for t in card:
-        m = re.search(r"(\d+(?:\.\d+)?)\s*折", t)
-        if m:
-            discount = m.group(1)
-            break
-    if discount is None:
-        # 数字字号大、「折」字号小，OCR 可能拆成两段，单独的数字就是折扣
-        nums = [t.strip() for t in card if re.fullmatch(r"\d+(\.\d+)?", t.strip())]
-        discount = nums[0] if nums else None
+    discount = find_discount(card)
     limit = None
     for t in card:
         m = re.search(r"最多抵\s*(\d+)\s*元", t)
@@ -482,7 +507,8 @@ def find_coupon(items, sw, sh):
         t.strip() for t, _, cx, cy, _ in items
         if cx < lx - 0.15 * sw and ly - 0.01 * sh < cy <= ly + 0.06 * sh and re.fullmatch(r"\d{3,6}", t.strip())
     ]
-    return {"discount": discount, "limit": limit, "name": name, "coins": coins[0] if coins else None}
+    return {"source": "商品卡", "discount": discount, "limit": limit, "name": name,
+            "coins": coins[0] if coins else None}
 
 
 def save_snapshot(screen, folder):
@@ -544,10 +570,11 @@ def check_coupon(screen, items, progress):
     now = datetime.now()
     path = save_snapshot(screen, "coupon")
     lines = [
-        "抖音商城出现折扣券",
+        f"抖音商城出现折扣券（{coupon['source']}）",
         f"折扣：{d + '折' if d else '未识别'}" + (f"，最多抵 {coupon['limit']}元" if coupon["limit"] else ""),
-        f"商品：{coupon['name'] or '未识别'}",
     ]
+    if coupon["name"]:
+        lines.append(f"商品：{coupon['name']}")
     if coupon["coins"]:
         lines.append(f"首单返：{coupon['coins']}金币")
     lines.append(f"时间：{now:%Y-%m-%d %H:%M:%S}，{progress}")
@@ -580,6 +607,7 @@ class AdState:
         self.last_progress = time.time()  # 上次有进展（看完一个广告/在等冷却）的时间，用来判断卡住
         self.stuck_notified = False       # 这次卡住是否已经发过通知
         self.unknown_notified = False     # 这次认不出页面是否已经发过通知，认出页面后清掉
+        self.unknown_total = 0            # 连续认不出的总轮数，按返回键不清零，认出页面才清零
 
     def mark_progress(self):
         self.last_progress = time.time()
@@ -718,6 +746,9 @@ def handle_common(screen, items, page, data, state):
         state.new_ad(resumed=True)
 
     if page == "live_prompt":
+        # 福利弹窗可能和进直播间提示同时出现，点「取消」前先查券
+        if not state.coupon_done:
+            state.coupon_done = check_coupon(screen, items, state.progress_text())
         (score, _, _, text, _), (x, y) = data
         print(f"📺 广告要跳直播间（{text}），点「取消」")
         tap(screen, "取消", text, score, x, y)
@@ -759,20 +790,27 @@ def handle_common(screen, items, page, data, state):
         return CLICK_COOLDOWN
 
     state.unknown_rounds += 1
+    state.unknown_total += 1
     preview = ocr_preview(items)[:200] or "OCR 无结果"
-    print(f"· 认不出页面（{state.unknown_rounds}/{UNKNOWN_BACK_AFTER}，满 {UNKNOWN_BACK_AFTER} 轮按返回键并发飞书通知）:", preview)
+    if UNKNOWN_BACK_AFTER == UNKNOWN_NOTIFY_AFTER:
+        rule = f"满 {UNKNOWN_BACK_AFTER} 轮按返回键并发飞书通知"
+    else:
+        rule = f"满 {UNKNOWN_BACK_AFTER} 轮按返回键；连续 {UNKNOWN_NOTIFY_AFTER} 轮认不出发飞书通知"
+    print(f"· 认不出页面（{state.unknown_rounds}/{UNKNOWN_BACK_AFTER}，{rule}）:", preview)
+    # 连续 UNKNOWN_NOTIFY_AFTER 轮都认不出才通知，同一段只发一次
+    if state.unknown_total >= UNKNOWN_NOTIFY_AFTER and not state.unknown_notified:
+        state.unknown_notified = state.stuck_notified = True
+        backs = (state.unknown_total - 1) // UNKNOWN_BACK_AFTER  # 这一轮之前已经按过几次返回键
+        notify(
+            f"【{state.name}】抖音商城脚本认不出当前页面\n"
+            f"连续 {UNKNOWN_NOTIFY_AFTER} 轮没认出页面，"
+            + (f"按过 {backs} 次返回键也没回到认识的页面\n" if backs else "先按返回键试试\n") +
+            f"屏幕上的字：{preview[:80]}\n"
+            f"进度：{state.progress_text()}\n"
+            f"时间：{datetime.now():%Y-%m-%d %H:%M:%S}",
+            save_snapshot(screen, "stuck"),
+        )
     if state.unknown_rounds >= UNKNOWN_BACK_AFTER:
-        # 连续认不出才通知，广告加载时短暂的黑屏不算；同一段认不出只发一次
-        if not state.unknown_notified:
-            state.unknown_notified = state.stuck_notified = True
-            notify(
-                f"【{state.name}】抖音商城脚本认不出当前页面\n"
-                f"连续 {UNKNOWN_BACK_AFTER} 轮没认出页面，先按返回键试试\n"
-                f"屏幕上的字：{preview[:80]}\n"
-                f"进度：{state.progress_text()}\n"
-                f"时间：{datetime.now():%Y-%m-%d %H:%M:%S}",
-                save_snapshot(screen, "stuck"),
-            )
         print(f"↩ 连续 {UNKNOWN_BACK_AFTER} 轮认不出页面，按一次返回键")
         press_back()
         state.unknown_rounds = 0
@@ -813,7 +851,7 @@ def run(title, detect_page, handle, state, page_names):
                     human_paused = True
                     print(f"✋ 检测到有人在操作手机，暂停自动操作，最后一次触摸 {HUMAN_PAUSE}s 后继续")
                 state.mark_progress()
-                state.unknown_rounds = 0
+                state.unknown_rounds = state.unknown_total = 0
                 time.sleep(1)
                 continue
             if human_paused:
@@ -834,7 +872,7 @@ def run(title, detect_page, handle, state, page_names):
             if page != "live_room":
                 live_close_tries = 0
             if page != "unknown":
-                state.unknown_rounds = 0
+                state.unknown_rounds = state.unknown_total = 0
                 state.unknown_notified = False
 
             wait = handle(screen, items, page, data, state)
