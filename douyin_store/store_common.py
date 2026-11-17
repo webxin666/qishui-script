@@ -1,7 +1,9 @@
+import atexit
 import base64
 import hashlib
 import hmac
 import json
+import threading
 import urllib.request
 import cv2
 import numpy as np
@@ -80,6 +82,8 @@ COUPON_Y_MIN = 0.70
 COUPON_MAX_DISCOUNT = None
 # 这么多秒没看完一个广告（冷却倒计时等待不算），就当脚本卡住了，发飞书通知（估：正常一个广告 30 秒左右）
 STUCK_SECONDS = 300
+# 检测到有人用手指操作手机，就暂停自动操作，最后一次触摸后这么多秒再继续
+HUMAN_PAUSE = 30
 # ===========================================
 
 DEBUG_DIR = None      # 由各条线 setup() 设置
@@ -90,6 +94,8 @@ paused_until = {}   # target -> 恢复点击的时间戳
 LIVE_TARGET = "直播间×"
 live_close_tries = 0  # 连续尝试退出直播间的次数
 DRY_RUN = False       # --dry 时只打印要点哪里，不真点
+human_touch_at = 0.0  # 最近一次检测到真手指触摸屏幕的时间
+touch_proc = None     # 后台监听触摸屏的 getevent 进程
 
 COMMON_PAGE_NAMES = {
     "live_prompt": "进直播间提示",
@@ -134,6 +140,50 @@ def screenshot():
         return None
     img = cv2.imdecode(np.frombuffer(result.stdout, np.uint8), cv2.IMREAD_COLOR)
     return img
+
+
+def find_touchscreen():
+    """找触摸屏对应的 /dev/input/eventN：带 ABS_MT_POSITION_X（多点触控坐标）的那个设备"""
+    try:
+        out = adb_command(["shell", "getevent", "-lp"]).stdout
+    except Exception:
+        return None
+    dev = None
+    for line in out.splitlines():
+        m = re.match(r"add device \d+: (\S+)", line)
+        if m:
+            dev = m.group(1)
+        elif "ABS_MT_POSITION_X" in line and dev:
+            return dev
+    return None
+
+
+def watch_touch():
+    """后台线程：盯着触摸屏的原始事件。
+    脚本用 adb input tap 点的不经过触摸屏（真机实测），只有真手指点屏幕才会有事件"""
+    global human_touch_at, touch_proc
+    dev = find_touchscreen()
+    if not dev:
+        print("⚠️ 没找到触摸屏设备，检测不了有没有人在操作手机")
+        return
+    print(f"👀 盯着触摸屏 {dev}：有人用手指操作手机就暂停，最后一次触摸 {HUMAN_PAUSE}s 后继续")
+    while True:
+        try:
+            # 直接读设备的原始字节：cat 读到就转发，不像 getevent 走管道时会攒够一块才输出
+            touch_proc = subprocess.Popen(
+                ["adb", "exec-out", "cat", dev], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            )
+            while touch_proc.stdout.read1(4096):
+                human_touch_at = time.time()
+        except Exception:
+            pass
+        time.sleep(5)  # adb 断开等情况，过一会儿重连
+
+
+@atexit.register
+def stop_watch_touch():
+    if touch_proc and touch_proc.poll() is None:
+        touch_proc.terminate()
 
 
 def press_back():
@@ -752,9 +802,24 @@ def run(title, detect_page, handle, state, page_names):
     print(f"🚀 {title}")
     print(f"   置信度>={OCR_SCORE}  轮询={POLL_INTERVAL}s  倒计时轮询={COUNTDOWN_POLL}s")
     print(f"   点击调试图目录: {DEBUG_DIR}")
+    threading.Thread(target=watch_touch, daemon=True).start()
+    human_paused = False
 
     while True:
         try:
+            # 有人在用手指操作手机：先不截图不点击，也不算卡住，等他放下手机
+            if time.time() - human_touch_at < HUMAN_PAUSE:
+                if not human_paused:
+                    human_paused = True
+                    print(f"✋ 检测到有人在操作手机，暂停自动操作，最后一次触摸 {HUMAN_PAUSE}s 后继续")
+                state.mark_progress()
+                state.unknown_rounds = 0
+                time.sleep(1)
+                continue
+            if human_paused:
+                human_paused = False
+                print("▶ 手机没人操作了，继续自动操作")
+
             screen = screenshot()
             if screen is None:
                 print("⚠️ 截图失败，检查 adb 连接")
@@ -816,11 +881,30 @@ def dry_run(paths, detect_page, handle, make_state, page_names):
         handle(screen, items, page, data, state)
 
 
+def touch_test(seconds=60):
+    """监听一段时间，每次认出手指触摸就打一行"""
+    threading.Thread(target=watch_touch, daemon=True).start()
+    print(f"👆 接下来 {seconds} 秒，用手指点几下手机屏幕（点状态栏或空白处就行）")
+    last, count, end = 0.0, 0, time.time() + seconds
+    while time.time() < end:
+        # 一次触摸会连着来很多事件，隔 1 秒以上才算新的一次
+        if human_touch_at - last > 1.0:
+            count += 1
+            print(f"   ✋ 第 {count} 次：{datetime.now():%H:%M:%S} 检测到手指触摸")
+        if human_touch_at:
+            last = human_touch_at
+        time.sleep(0.1)
+    print(f"结束：{seconds} 秒内检测到 {count} 次触摸" + ("" if count else "，没检测到，检查手机是否连着、屏幕有没有亮"))
+
+
 def main(title, detect_page, handle, make_state, page_names):
     """python 脚本.py 正常跑；python 脚本.py --dry 截图1.png 截图2.png 离线看页面判断；
-    python 脚本.py --notify-test 发一条测试消息，检查飞书机器人配好没有"""
+    python 脚本.py --notify-test 发一条测试消息，检查飞书机器人配好没有；
+    python 脚本.py --touch-test 监听 60 秒，用手指点手机屏幕，检查能不能认出有人在操作"""
     if len(sys.argv) > 1 and sys.argv[1] == "--notify-test":
         notify(f"抖音商城脚本：飞书通知测试\n时间：{datetime.now():%Y-%m-%d %H:%M:%S}", "(测试消息，没有截图)")
+    elif len(sys.argv) > 1 and sys.argv[1] == "--touch-test":
+        touch_test()
     elif len(sys.argv) > 2 and sys.argv[1] == "--dry":
         dry_run(sys.argv[2:], detect_page, handle, make_state, page_names)
     else:
