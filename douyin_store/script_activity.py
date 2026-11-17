@@ -4,7 +4,8 @@ import store_common as common
 from store_common import find_targets, tap
 
 # 抖音商城看广告领金币 · 线一：金币购物抵钱 → 做任务赚金币 → 看广告视频
-# 启动时停在「做任务赚金币」弹层（读出 N/M 次，看到 M 次就停）或者直接停在广告页都行
+# 看广告不限次数，一直看到手动停止，只记现在看到第几个（从任务列表启动时接着列表上的次数数）
+# 启动时停在「做任务赚金币」弹层或者直接停在广告页都行
 # 离线调试：python script_activity.py --dry 截图1.png 截图2.png（只打印页面判断，不点击）
 
 common.setup(
@@ -61,5 +62,5 @@ def handle(screen, items, page, data, state):
 if __name__ == "__main__":
     common.main(
         "抖音商城看广告脚本启动 · 线一：做任务赚金币 → 看广告视频",
-        detect_page, handle, lambda: common.AdState("看广告视频"), PAGE_NAMES,
+        detect_page, handle, lambda: common.AdState("看广告视频", limited=False), PAGE_NAMES,
     )

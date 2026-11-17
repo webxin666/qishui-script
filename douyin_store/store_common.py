@@ -45,8 +45,9 @@ STRICT_TARGETS = {"领取成功"}
 ROW_TOL = 0.03
 # 新广告开始后这么多秒内认出的「领取成功」，当成上一个广告还没消失的残影，不计数也不点
 MIN_AD_SECONDS = 5.0
-# 连续这么多轮认不出页面，按一次返回键
-UNKNOWN_BACK_AFTER = 10
+# 连续这么多轮（每轮截一次图）认不出页面，就按一次返回键并发飞书通知；中间认出任何页面就从 0 重新数
+# 广告刚加载时会闪一两轮认不出，属于正常
+UNKNOWN_BACK_AFTER = 3
 # 列表页里读不到次数/按钮时最多重试这么多轮
 LIST_TRIES = 3
 # 任务按钮变成「01:50」这种冷却倒计时期间，最多隔这么多秒再截图看一次
@@ -77,10 +78,11 @@ LIVE_CANCEL_OFFSET = 0.07
 COUPON_Y_MIN = 0.70
 # 只通知不高于这个折扣的券，如 6 表示 6 折及以下；None 表示所有折扣券都通知
 COUPON_MAX_DISCOUNT = None
+# 这么多秒没看完一个广告（冷却倒计时等待不算），就当脚本卡住了，发飞书通知（估：正常一个广告 30 秒左右）
+STUCK_SECONDS = 300
 # ===========================================
 
 DEBUG_DIR = None      # 由各条线 setup() 设置
-COUPON_DIR = None
 ocr_engine = None
 click_seq = 0
 recent_clicks = []  # [(时间戳, target, x, y)]，用于防连点
@@ -102,9 +104,8 @@ COMMON_PAGE_NAMES = {
 
 def setup(debug_dir, roi=None, strict=()):
     """各条线启动前调用：设置调试图目录，补上这条线自己的点击区域和点击目标"""
-    global DEBUG_DIR, COUPON_DIR
+    global DEBUG_DIR
     DEBUG_DIR = debug_dir
-    COUPON_DIR = os.path.join(debug_dir, "coupon")
     TARGET_ROI.update(roi or {})
     STRICT_TARGETS.update(strict)
 
@@ -434,6 +435,19 @@ def find_coupon(items, sw, sh):
     return {"discount": discount, "limit": limit, "name": name, "coins": coins[0] if coins else None}
 
 
+def save_snapshot(screen, folder):
+    """把当前整屏原图存到调试目录下的 folder 子文件夹（coupon / stuck），返回路径"""
+    if DRY_RUN:
+        return "(dry 不保存)"
+    if screen is None:
+        return "（截图失败，没有截图）"
+    d = os.path.join(DEBUG_DIR, folder)
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, f"{datetime.now():%Y%m%d_%H%M%S}.png")
+    cv2.imwrite(path, screen)
+    return path
+
+
 def notify(text, image_path):
     """打日志，并通过飞书群的自定义机器人发一条文字通知。
     自定义机器人发不了本地图片，截图只附本机路径"""
@@ -478,12 +492,7 @@ def check_coupon(screen, items, progress):
         print(f"🎫 折扣券 {d}折，高于 {COUPON_MAX_DISCOUNT}折，不通知")
         return True
     now = datetime.now()
-    if DRY_RUN:
-        path = "(dry 不保存)"
-    else:
-        os.makedirs(COUPON_DIR, exist_ok=True)
-        path = os.path.join(COUPON_DIR, f"{now:%Y%m%d_%H%M%S}.png")
-        cv2.imwrite(path, screen)
+    path = save_snapshot(screen, "coupon")
     lines = [
         "抖音商城出现折扣券",
         f"折扣：{d + '折' if d else '未识别'}" + (f"，最多抵 {coupon['limit']}元" if coupon["limit"] else ""),
@@ -501,10 +510,11 @@ def check_coupon(screen, items, progress):
 class AdState:
     """一条线的计数和状态。进度以页面上读到的数字为准，读到之后再自己往上数"""
 
-    def __init__(self, name, unit="次", verb=""):
+    def __init__(self, name, unit="次", verb="", limited=True):
         self.name = name        # 任务名，如「看广告视频」
         self.unit = unit
         self.verb = verb        # 进度前缀，如「已拆 」
+        self.limited = limited  # 有没有次数上限；没有上限（看广告视频）就一直看，只记第几个
         self.base = 0           # 最近一次从页面上读到的已完成次数 N
         self.total = 0          # M；0 表示还没读到（直接从广告页启动）
         self.watched = 0        # 读到 N 之后又看完几个
@@ -516,20 +526,32 @@ class AdState:
         self.unknown_rounds = 0
         # 最后一个广告看完后，是否也点「领取成功」退出广告再停（线二要回到拆红包页）
         self.close_last_ad = False
+        self.last_page = "unknown"
+        self.last_progress = time.time()  # 上次有进展（看完一个广告/在等冷却）的时间，用来判断卡住
+        self.stuck_notified = False       # 这次卡住是否已经发过通知
+        self.unknown_notified = False     # 这次认不出页面是否已经发过通知，认出页面后清掉
+
+    def mark_progress(self):
+        self.last_progress = time.time()
+        self.stuck_notified = False
 
     @property
     def progress(self):
         return self.base + self.watched
 
     def progress_text(self):
-        """和页面上的写法一致，N 是已经完成的次数"""
+        """有上限时和页面上的写法一致（N 是已经完成的次数）；没上限时只说第几个"""
+        if not self.limited:
+            if self.counted:
+                return f"{self.name} 已看完 {self.progress} 个"
+            return f"{self.name} 第 {self.progress + 1} 个"
         if self.total:
             return f"{self.name} {self.verb}{self.progress}/{self.total}{self.unit}"
         return f"{self.name} 进度没读到（直接从广告页启动，回到列表页才能读到）"
 
     def finished(self):
-        # 直接从广告页启动、没读到进度时不按个数停，回到列表页读到次数再判断
-        return self.total > 0 and self.progress >= self.total
+        # 没上限的一直看；直接从广告页启动、没读到进度时也不按个数停，回到列表页读到次数再判断
+        return self.limited and self.total > 0 and self.progress >= self.total
 
     def sync(self, done, total):
         self.base, self.total, self.watched = done, total, 0
@@ -590,13 +612,15 @@ def handle_task_list(screen, data, state, button_name, enters_ad=True):
         if state.finished():
             print("今天的次数已经满了")
             return None
-    if progress and button is None and cooldown is not None:
+    if button is None and cooldown is not None:
         state.list_misses = 0
+        state.mark_progress()  # 等冷却是正常等待，不算卡住
         print(f"⏳ {state.name}冷却中，还要 {cooldown // 60:02d}:{cooldown % 60:02d}，等它走完再点「{button_name}」")
         return min(cooldown + 1, COOLDOWN_CHECK)
-    if progress is None or button is None:
+    # 没上限的任务读不到次数也照样点（看过 10 次以后列表上的数字可能对不上）
+    if button is None or (progress is None and state.limited):
         state.list_misses += 1
-        what = "次数" if progress is None else f"「{button_name}」"
+        what = f"「{button_name}」" if button is None else "次数"
         print(f"⚠️ 任务列表里没认出{what}（{state.list_misses}/{LIST_TRIES}）")
         return None if state.list_misses >= LIST_TRIES else POLL_INTERVAL
     state.list_misses = 0
@@ -659,6 +683,7 @@ def handle_common(screen, items, page, data, state):
         if not state.counted:
             state.counted = True
             state.watched += 1
+            state.mark_progress()
             print(f"✅ 广告看完：{state.progress_text()}")
         score, cx, cy, text, _ = data[0]
         if state.finished() and not state.close_last_ad:
@@ -684,9 +709,21 @@ def handle_common(screen, items, page, data, state):
         return CLICK_COOLDOWN
 
     state.unknown_rounds += 1
-    print(f"· 认不出页面（{state.unknown_rounds}/{UNKNOWN_BACK_AFTER}）:", ocr_preview(items)[:200] or "OCR 无结果")
+    preview = ocr_preview(items)[:200] or "OCR 无结果"
+    print(f"· 认不出页面（{state.unknown_rounds}/{UNKNOWN_BACK_AFTER}，满 {UNKNOWN_BACK_AFTER} 轮按返回键并发飞书通知）:", preview)
     if state.unknown_rounds >= UNKNOWN_BACK_AFTER:
-        print("↩ 连续认不出页面，按一次返回键")
+        # 连续认不出才通知，广告加载时短暂的黑屏不算；同一段认不出只发一次
+        if not state.unknown_notified:
+            state.unknown_notified = state.stuck_notified = True
+            notify(
+                f"【{state.name}】抖音商城脚本认不出当前页面\n"
+                f"连续 {UNKNOWN_BACK_AFTER} 轮没认出页面，先按返回键试试\n"
+                f"屏幕上的字：{preview[:80]}\n"
+                f"进度：{state.progress_text()}\n"
+                f"时间：{datetime.now():%Y-%m-%d %H:%M:%S}",
+                save_snapshot(screen, "stuck"),
+            )
+        print(f"↩ 连续 {UNKNOWN_BACK_AFTER} 轮认不出页面，按一次返回键")
         press_back()
         state.unknown_rounds = 0
     return POLL_INTERVAL
@@ -694,7 +731,23 @@ def handle_common(screen, items, page, data, state):
 
 # ---------------- 主循环 ----------------
 
-def run(title, detect_page, handle, state):
+def check_stuck(state, screen, where):
+    """太久没看完一个广告就发一次飞书通知；恢复后（又看完一个）再卡住会再发"""
+    stuck = time.time() - state.last_progress
+    if state.stuck_notified or stuck < STUCK_SECONDS:
+        return
+    state.stuck_notified = True
+    print(f"🚨 已经 {stuck / 60:.0f} 分钟没看完一个广告，可能卡住了")
+    notify(
+        f"【{state.name}】抖音商城脚本好像卡住了\n"
+        f"{stuck / 60:.0f} 分钟没看完一个广告，当前：{where}\n"
+        f"进度：{state.progress_text()}\n"
+        f"时间：{datetime.now():%Y-%m-%d %H:%M:%S}",
+        save_snapshot(screen, "stuck"),
+    )
+
+
+def run(title, detect_page, handle, state, page_names):
     global live_close_tries
     print(f"🚀 {title}")
     print(f"   置信度>={OCR_SCORE}  轮询={POLL_INTERVAL}s  倒计时轮询={COUNTDOWN_POLL}s")
@@ -705,18 +758,31 @@ def run(title, detect_page, handle, state):
             screen = screenshot()
             if screen is None:
                 print("⚠️ 截图失败，检查 adb 连接")
+                check_stuck(state, None, "截图失败，可能 adb 断开了")
                 time.sleep(3)
                 continue
+            check_stuck(state, screen, page_names.get(state.last_page, state.last_page))
             sh, sw = screen.shape[:2]
             items = run_ocr(screen)
             page, data = detect_page(items, sw, sh)
+            state.last_page = page
             if page != "live_room":
                 live_close_tries = 0
             if page != "unknown":
                 state.unknown_rounds = 0
+                state.unknown_notified = False
 
             wait = handle(screen, items, page, data, state)
             if wait is None:
+                if not state.finished():
+                    # 次数没做满就停了（弹层被关、广告一直加载不出来等），要人来看一下
+                    notify(
+                        f"【{state.name}】抖音商城脚本中途停止了\n"
+                        f"停在：{page_names.get(page, page)}\n"
+                        f"进度：{state.progress_text()}\n"
+                        f"时间：{datetime.now():%Y-%m-%d %H:%M:%S}",
+                        save_snapshot(screen, "stuck"),
+                    )
                 break
             if wait > 0:
                 time.sleep(wait)
@@ -758,4 +824,4 @@ def main(title, detect_page, handle, make_state, page_names):
     elif len(sys.argv) > 2 and sys.argv[1] == "--dry":
         dry_run(sys.argv[2:], detect_page, handle, make_state, page_names)
     else:
-        run(title, detect_page, handle, make_state())
+        run(title, detect_page, handle, make_state(), page_names)
