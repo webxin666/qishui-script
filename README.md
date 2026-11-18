@@ -21,11 +21,19 @@ pip3 install -r requirements.txt
 3. 通过数据线把手机连接到电脑，手机弹窗勾选允许调试。
 
 
+### Windows 一键启动
+双击 `windows启动.bat`，按提示输入数字后回车：
+- `1` 汽水音乐 看广告领 VIP
+- `2` 抖音商城 看广告视频
+- `3` 抖音商城 天天拆红包
+
+脚本结束后按任意键回到菜单，可以接着选别的。
+
 ### 开始使用
 1. 手机打开 汽水音乐，进入看广告领时长页面（保持屏幕常亮）。
 2. 在命令行运行
 ```bash
-# Windows（也可以直接双击 windows启动汽水music.bat）
+# Windows（也可以双击 windows启动.bat 选 1）
 python qishui_script.py
 
 # Mac
@@ -39,9 +47,9 @@ python3 qishui_script.py
 ## 抖音商城看广告领金币
 
 ```bash
-# Windows
-windows启动store_activity.bat
-windows启动store_red.bat
+# Windows（也可以双击 windows启动.bat 选 2 / 3）
+python douyin_store\script_activity.py
+python douyin_store\script_red.py
 
 # Mac
 python3 douyin_store/script_activity.py
