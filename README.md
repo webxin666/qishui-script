@@ -1,6 +1,6 @@
 # 汽水音乐自动看广告领取VIP
 
-当前适用 app 版本：`19.1.1`，持续跟新....
+当前适用 app 版本：`19.1.1`，持续更新....
 
 ### 安装运行环境
 1. 安装 Python 3
@@ -47,9 +47,9 @@ python3 qishui_script.py
 ## 抖音商城看广告领金币
 
 ```bash
-# Windows（也可以双击 windows启动.bat 选 2 / 3）
-python douyin_store\script_activity.py
-python douyin_store\script_red.py
+# Windows
+windows启动store_activity.bat
+windows启动store_red.bat
 
 # Mac
 python3 douyin_store/script_activity.py
