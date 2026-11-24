@@ -16,11 +16,18 @@ from datetime import datetime
 
 from rapidocr_onnxruntime import RapidOCR
 
-# 飞书机器人地址和密钥放在 store_config.py（不提交 git），没有这个文件就只打日志不发通知
+# 飞书机器人地址、密钥和折扣券白名单放在 store_config.py（本地填的值不提交 git），
+# 没有这个文件或者缺某一项，就按默认值：不发通知、所有折扣券都算
 try:
-    from store_config import FEISHU_WEBHOOK, FEISHU_SECRET
+    import store_config
 except ImportError:
-    FEISHU_WEBHOOK, FEISHU_SECRET = "", ""
+    store_config = None
+FEISHU_WEBHOOK = getattr(store_config, "FEISHU_WEBHOOK", "")
+FEISHU_SECRET = getattr(store_config, "FEISHU_SECRET", "")
+# 想蹲的商品关键词：广告画面上出现过其中一个词，这个广告的折扣券才发通知；空列表表示都通知
+COUPON_WHITELIST = [k.strip() for k in getattr(store_config, "COUPON_WHITELIST", []) if k.strip()]
+# 不想要的商品关键词：广告画面上出现过其中一个词，这个广告的折扣券就不通知，比白名单优先
+COUPON_BLACKLIST = [k.strip() for k in getattr(store_config, "COUPON_BLACKLIST", []) if k.strip()]
 
 # 抖音商城看广告脚本的公共部分：adb / OCR / 文字匹配、广告页（倒计时、领取成功）、跳直播间、
 # 折扣券通知、任务列表、计数和主循环。每条线的脚本只写自己的页面，启动前调用 setup()
@@ -40,9 +47,13 @@ TARGET_ROI = {
     "进入直播间": {"x": (0.20, 0.80), "y": (0.55, 0.80)},  # 「3s后进入直播间 | 取消」提示条
     "领取成功": {"x": (0.60, 1.0), "y": (0.0, 0.12)},      # 倒计时结束后的右上角
     "可领奖励": {"x": (0.50, 1.0), "y": (0.0, 0.12)},      # 右上角「27s后可领奖励」
+    # 金币弹窗的按钮：看完一个后的「再看一个视频继续领奖励」、广告中途的「再看26s后可领取奖励」
+    "继续领奖励": {"x": (0.25, 0.75), "y": (0.45, 0.70)},
+    "继续观看": {"x": (0.25, 0.75), "y": (0.45, 0.70)},
+    "坚持退出": {"x": (0.25, 0.75), "y": (0.50, 0.75)},
 }
-# 点击目标：识别出的文字比目标词长 2 个字以上就不算，排除标题里顺带包含目标词的情况
-STRICT_TARGETS = {"领取成功"}
+# 点击目标：识别出的文字比目标词长 2 个字以上就不算，排除弹窗标题「再看一个视频继续领奖励」这类顺带包含目标词的
+STRICT_TARGETS = {"领取成功", "继续领奖励", "继续观看", "坚持退出"}
 # 任务列表里按钮和任务标题算同一行的高度容差（相对屏幕高度）
 ROW_TOL = 0.03
 # 新广告开始后这么多秒内认出的「领取成功」，当成上一个广告还没消失的残影，不计数也不点
@@ -101,6 +112,7 @@ touch_proc = None     # 后台监听触摸屏的 getevent 进程
 
 COMMON_PAGE_NAMES = {
     "live_prompt": "进直播间提示",
+    "coin_popup": "金币弹窗",
     "reward_done": "广告结束",
     "countdown": "广告播放中",
     "task_list": "任务列表",
@@ -454,11 +466,13 @@ def close_live(screen, x, y, score, how):
 
 def find_discount(texts):
     """从几段文字里取折扣：「6.5折」；或者大字「6.5」和小字「折」被 OCR 拆开时，单独的那个数字"""
+    # 折扣只可能在 0~10 之间；弹窗被提示条盖住时会把「6」认成「0」，这种当没认出
+    ok = lambda v: 0 < float(v) < 10
     for t in texts:
         m = re.search(r"(\d+(?:\.\d+)?)\s*折", t)
-        if m:
+        if m and ok(m.group(1)):
             return m.group(1)
-    nums = [t.strip() for t in texts if re.fullmatch(r"\d+(\.\d+)?", t.strip())]
+    nums = [t.strip() for t in texts if re.fullmatch(r"\d+(\.\d+)?", t.strip()) and ok(t.strip())]
     return nums[0] if nums else None
 
 
@@ -474,10 +488,12 @@ def find_coupon_popup(items, sw, sh):
         return None
     lx, ly = labels[0]
     row = [t for t, _, cx, cy, _ in items if abs(cy - ly) <= 0.02 * sh and cx < lx]
+    # 折扣那一格：「折扣券」左边、同一行。单个大字「7」整图 OCR 常常框不到，裁出来再认就能认出
+    cell = (int(0.12 * sw), int(ly - 0.035 * sh), int(lx - 0.05 * sw), int(ly + 0.035 * sh))
     # 首单返金币：标题和折扣券之间那一行的数字，如「5000 金币 首单最高可返」
     coins = [t.strip() for t, _, _, cy, _ in items if ty < cy < ly - 0.01 * sh and re.fullmatch(r"\d{3,6}", t.strip())]
     return {"source": "福利弹窗", "discount": find_discount(row), "limit": None, "name": None,
-            "coins": coins[0] if coins else None}
+            "coins": coins[0] if coins else None, "cell": cell}
 
 
 def find_coupon(items, sw, sh):
@@ -524,9 +540,18 @@ def save_snapshot(screen, folder):
     return path
 
 
+def short_path(path):
+    """通知里的截图路径只写 douyin_store 下面那段，如 /debug_images_activity/stuck/20261119_160810.png；
+    不是这个目录下的文件（或者「没有截图」这类说明）原样返回"""
+    base = os.path.dirname(os.path.abspath(__file__))
+    if not os.path.isabs(path) or os.path.commonpath([base, os.path.abspath(path)]) != base:
+        return path
+    return "/" + os.path.relpath(path, base).replace(os.sep, "/")
+
+
 def notify(text, image_path):
     """打日志，并通过飞书群的自定义机器人发一条文字通知。
-    自定义机器人发不了本地图片，截图只附本机路径"""
+    自定义机器人发不了本地图片，截图只附路径；终端日志里写完整路径，方便直接点开"""
     print()
     print("🔔 " + text.replace("\n", "\n   "))
     print(f"   截图: {image_path}")
@@ -534,7 +559,7 @@ def notify(text, image_path):
         print("   （没配置飞书机器人，或者是 --dry，只打日志）")
         print()
         return
-    body = {"msg_type": "text", "content": {"text": f"{text}\n截图：{image_path}"}}
+    body = {"msg_type": "text", "content": {"text": f"{text}\n截图：{short_path(image_path)}"}}
     if FEISHU_SECRET:
         # 签名校验：用「时间戳\n密钥」做 HmacSHA256 的 key，对空串签名再 base64
         ts = str(int(time.time()))
@@ -557,29 +582,102 @@ def notify(text, image_path):
     print()
 
 
-def check_coupon(screen, items, progress):
-    """画面里有折扣券就发通知，progress 是写进通知的任务进度；认出折扣券（不管发没发）返回 True，用于每个广告只处理一次"""
+def match_keywords(keywords, texts):
+    """在这个广告出现过的文字里找关键词（不分大小写、忽略空格），返回 (关键词, 含这个词的那行字)，没命中返回 (None, None)"""
+    for kw in keywords:
+        key = kw.replace(" ", "").lower()
+        for t in texts:
+            if key in t.replace(" ", "").lower():
+                return kw, t
+    return None, None
+
+
+def bottom_card_name(items, sw, sh):
+    """广告底部商品卡上的店铺名和简介，如「川岭渡路亚 专门超远投的追翘铅笔已经上」；福利弹窗上不写商品，拿这个当商品名"""
+    lines = sorted(
+        (cy, t.strip()) for t, _, cx, cy, _ in items
+        # 左边是店铺头像，右边是「查看详情」按钮，只要中间的字；去掉「下单返金币」这类小标签
+        if cy > 0.85 * sh and 0.20 * sw < cx < 0.72 * sw and not re.search(r"返金币|最高|折扣券", t)
+    )
+    # 简介太长时会和右边的「查看详情」粘成一行
+    return " ".join(re.sub(r"\s*查看详情$", "", t) for _, t in lines[:2]).strip() or None
+
+
+def ocr_discount_cell(screen, cell):
+    """整图没认出折扣数字时，裁出折扣那一格单独 OCR"""
+    x0, y0, x1, y1 = cell
+    crop = screen[max(y0, 0):y1, max(x0, 0):x1]
+    if crop.size == 0:
+        return None
+    result, _ = get_ocr()(crop, use_cls=False)
+    return find_discount([row[1] for row in result or [] if float(row[2]) >= OCR_SCORE])
+
+
+def check_coupon(screen, items, state):
+    """每帧广告画面都调：认出折扣券、记下这个广告出现过的文字，再交给 settle_coupon 发通知"""
+    if state.coupon_done:
+        return
     sh, sw = screen.shape[:2]
-    coupon = find_coupon(items, sw, sh)
-    if not coupon:
-        return False
+    state.ad_texts.update(t for t, _, _, _, _ in items)
+    if state.coupon is None:
+        coupon = find_coupon(items, sw, sh)
+        if not coupon:
+            return
+        if coupon["discount"] is None and coupon.get("cell"):
+            coupon["discount"] = ocr_discount_cell(screen, coupon["cell"])
+        d = coupon["discount"]
+        if COUPON_MAX_DISCOUNT is not None and d is not None and float(d) > COUPON_MAX_DISCOUNT:
+            print(f"🎫 折扣券 {d}折，高于 {COUPON_MAX_DISCOUNT}折，不通知")
+            state.coupon_done = True
+            return
+        # 截的是出券那一帧，福利弹窗一会儿就消失了
+        coupon["shot"] = save_snapshot(screen, "coupon")
+        coupon["time"] = datetime.now()
+        coupon["name"] = coupon["name"] or bottom_card_name(items, sw, sh)
+        coupon["sent"] = False
+        state.coupon = coupon
+        print(f"🎫 认出折扣券（{coupon['source']}）：{d + '折' if d else '折扣未识别'}")
+    settle_coupon(state)
+
+
+def settle_coupon(state):
+    """认出券就马上发：画面上已经出现黑名单的词就不发，命中白名单发醒目的白名单通知，其余发普通通知。
+    商品标题常常要到广告后面才出来：按普通券发过以后才命中白名单的，再补发一条白名单通知；
+    发过以后才出现黑名单的词，就收不回了"""
+    coupon = state.coupon
+    if coupon is None or state.coupon_done:
+        return
+    bkw, bline = match_keywords(COUPON_BLACKLIST, state.ad_texts)
+    if bkw:
+        if coupon["sent"]:
+            print(f"🎫 画面上后来出现黑名单「{bkw}」（{bline}），通知已经发过了")
+        else:
+            print(f"🎫 画面上出现黑名单「{bkw}」（{bline}），这张折扣券不通知")
+        state.coupon_done = True
+        return
+    kw, line = match_keywords(COUPON_WHITELIST, state.ad_texts)
+    if coupon["sent"] and not kw:
+        return  # 已按普通券发过，继续看后面会不会出现白名单的词
+    late = coupon["sent"]
+    coupon["sent"] = True
+    # 命中了白名单，或者没配白名单（后面不用再等），这张券就处理完了
+    state.coupon_done = bool(kw) or not COUPON_WHITELIST
     d = coupon["discount"]
-    if COUPON_MAX_DISCOUNT is not None and d is not None and float(d) > COUPON_MAX_DISCOUNT:
-        print(f"🎫 折扣券 {d}折，高于 {COUPON_MAX_DISCOUNT}折，不通知")
-        return True
-    now = datetime.now()
-    path = save_snapshot(screen, "coupon")
-    lines = [
-        f"抖音商城出现折扣券（{coupon['source']}）",
-        f"折扣：{d + '折' if d else '未识别'}" + (f"，最多抵 {coupon['limit']}元" if coupon["limit"] else ""),
-    ]
+    if kw:
+        lines = [
+            f"🎯【白名单商品】{'刚才那张折扣券命中白名单了' if late else '抖音商城出现折扣券'}（{coupon['source']}）",
+            f"命中白名单：{kw}" + (f"（{line}）" if line != kw else ""),
+        ]
+    else:
+        lines = [f"抖音商城出现折扣券（{coupon['source']}）"]
+    lines.append(f"折扣：{d + '折' if d else '未识别'}" + (f"，最多抵 {coupon['limit']}元" if coupon["limit"] else ""))
     if coupon["name"]:
         lines.append(f"商品：{coupon['name']}")
     if coupon["coins"]:
         lines.append(f"首单返：{coupon['coins']}金币")
-    lines.append(f"时间：{now:%Y-%m-%d %H:%M:%S}，{progress}")
-    notify("\n".join(lines), path)
-    return True
+    lines.append(f"时间：{coupon['time']:%Y-%m-%d %H:%M:%S}，{state.progress_text()}")
+    print(f"🎫 {'命中白名单「' + kw + '」，发白名单通知' if kw else '发折扣券通知'}")
+    notify("\n".join(lines), coupon["shot"])
 
 
 # ---------------- 计数 ----------------
@@ -587,18 +685,23 @@ def check_coupon(screen, items, progress):
 class AdState:
     """一条线的计数和状态。进度以页面上读到的数字为准，读到之后再自己往上数"""
 
-    def __init__(self, name, unit="次", verb="", limited=True):
+    def __init__(self, name, unit="次", verb="", limited=True, min_coins=None):
         self.name = name        # 任务名，如「看广告视频」
         self.unit = unit
         self.verb = verb        # 进度前缀，如「已拆 」
         self.limited = limited  # 有没有次数上限；没有上限（看广告视频）就一直看，只记第几个
+        # 金币弹窗给的金币低于这个数就点「坚持退出」，None 表示不管多少都继续（拆红包要拆满）
+        self.min_coins = min_coins
         self.base = 0           # 最近一次从页面上读到的已完成次数 N
         self.total = 0          # M；0 表示还没读到（直接从广告页启动）
         self.watched = 0        # 读到 N 之后又看完几个
         self.in_ad = False      # 启动后是否已经进过广告
         self.ad_started = 0.0   # 当前广告开始的时间
         self.counted = True     # 当前广告是否已计数；还没进广告时为 True，不会误计
-        self.coupon_done = False
+        self.coupon_done = False  # 当前广告的折扣券处理完了没有（通知过，或者确定不通知）
+        self.coupon = None        # 当前广告认出的折扣券
+        self.low_coin_quit = None  # 因为弹窗金币太少点了「坚持退出」时记下金币数，开始下一个广告就清掉
+        self.ad_texts = set()     # 当前广告出现过的所有文字，用来匹配黑白名单
         self.list_misses = 0
         self.unknown_rounds = 0
         # 最后一个广告看完后，是否也点「领取成功」退出广告再停（线二要回到拆红包页）
@@ -640,6 +743,9 @@ class AdState:
         self.ad_started = 0.0 if resumed else time.time()
         self.counted = False
         self.coupon_done = False
+        self.coupon = None
+        self.ad_texts = set()
+        self.low_coin_quit = None
         print(f"▶ {'从广告页启动，接着看' if resumed else '开始看'}：{self.progress_text()}")
 
 
@@ -716,6 +822,56 @@ def detect_live_prompt(items, sw, sh):
     return ("live_prompt", prompt) if prompt else None
 
 
+def detect_coin_popup(items, sw, sh):
+    """金币弹窗：「再看一个视频继续领奖励 +148金币 [继续领奖励] 坚持退出」（看完一个后），
+    或「再看26s后可领取奖励 +18金币 [继续观看] 坚持退出」（广告中途）。
+    弹窗盖在广告上时，底下的「领取成功」「26s后可领奖励」还认得出来，所以要比广告页先判"""
+    quits = find_targets(items, "坚持退出", sw, sh)
+    if not quits:
+        return None
+    for button in ("继续领奖励", "继续观看"):
+        hits = find_targets(items, button, sw, sh)
+        if hits:
+            break
+    else:
+        return None
+    return "coin_popup", {"button": button, "continue": hits, "quit": quits[0], "coins": read_popup_coins(items, hits[0][2], sh)}
+
+
+def read_popup_coins(items, button_y, sh):
+    """读弹窗给的金币数：在继续按钮上方那一块找「金币」两个字，取同一行的数字。
+    只看按钮上方，底部商品卡上的「5000 金币」不算；OCR 可能认成「+148」「+148金币」，也可能把「+」和「18」拆开"""
+    for t, _, _, gy, _ in items:
+        if "金币" not in normalize_text(t) or not button_y - 0.15 * sh < gy < button_y:
+            continue
+        m = re.search(r"(\d+)\s*金币", t)
+        if m:
+            return int(m.group(1))
+        for t2, _, _, cy, _ in items:
+            m = re.fullmatch(r"\+?\s*(\d+)", t2.strip())
+            if m and abs(cy - gy) <= 0.02 * sh:
+                return int(m.group(1))
+    return None
+
+
+def handle_coin_popup(screen, data, state):
+    """金币太少（低于 state.min_coins）就点「坚持退出」回列表开下一轮，否则点继续"""
+    coins = data["coins"]
+    if state.min_coins is not None and coins is not None and coins < state.min_coins:
+        score, cx, cy, text, _ = data["quit"]
+        print(f"💰 只给 {coins} 金币，低于 {state.min_coins}，点「坚持退出」，结束这一轮")
+        if tap(screen, "坚持退出", text, score, int(cx), int(cy)):
+            state.low_coin_quit = coins
+        return CLICK_COOLDOWN
+    button, hits = data["button"], data["continue"]
+    print(f"💰 弹窗给 {coins if coins is not None else '?'} 金币，点「{button}」")
+    score, cx, cy, text, _ = hits[0]
+    # 「继续领奖励」会开始下一个广告；「继续观看」是接着看当前这个
+    if tap(screen, button, text, score, int(cx), int(cy), [c[:4] for c in hits]) and button == "继续领奖励":
+        state.new_ad()
+    return CLICK_COOLDOWN
+
+
 def detect_ad(items, sw, sh):
     """广告页：右上角「领取成功」或「Ns后可领奖励」"""
     hits = find_targets(items, "领取成功", sw, sh)
@@ -745,10 +901,12 @@ def handle_common(screen, items, page, data, state):
     if not state.in_ad and page in ("live_prompt", "countdown", "reward_done"):
         state.new_ad(resumed=True)
 
+    if page == "coin_popup":
+        return handle_coin_popup(screen, data, state)
+
     if page == "live_prompt":
         # 福利弹窗可能和进直播间提示同时出现，点「取消」前先查券
-        if not state.coupon_done:
-            state.coupon_done = check_coupon(screen, items, state.progress_text())
+        check_coupon(screen, items, state)
         (score, _, _, text, _), (x, y) = data
         print(f"📺 广告要跳直播间（{text}），点「取消」")
         tap(screen, "取消", text, score, x, y)
@@ -759,8 +917,7 @@ def handle_common(screen, items, page, data, state):
             print("· 刚进新广告，右上角还是上一个的「领取成功」，先不管")
             return POLL_INTERVAL
         # 点「领取成功 ×」会把商品卡一起关掉，所以先查折扣券
-        if not state.coupon_done:
-            state.coupon_done = check_coupon(screen, items, state.progress_text())
+        check_coupon(screen, items, state)
         if not state.counted:
             state.counted = True
             state.watched += 1
@@ -776,13 +933,15 @@ def handle_common(screen, items, page, data, state):
         return POLL_INTERVAL
 
     if page == "countdown":
-        if not state.coupon_done:
-            state.coupon_done = check_coupon(screen, items, state.progress_text())
+        check_coupon(screen, items, state)
         print(f"· 广告播放中：{data}")
         return COUNTDOWN_POLL
 
     if page == "main_page":
-        print("⚠️ 「做任务赚金币」弹层被关了，在金币购物抵钱主页按返回键会直接退出，停止脚本")
+        if state.low_coin_quit is not None:
+            print("🏁 金币太少点了「坚持退出」，回到了金币购物抵钱主页，这一轮结束，停止脚本")
+        else:
+            print("⚠️ 「做任务赚金币」弹层被关了，在金币购物抵钱主页按返回键会直接退出，停止脚本")
         return None
 
     if page == "live_room":
@@ -835,6 +994,33 @@ def check_stuck(state, screen, where):
     )
 
 
+def read_round_reward(items, sh):
+    """退出后的「奖励到账 686」：这一轮一共到账多少金币。金币图标常被认成「@686」，取同一行里的数字"""
+    for t, _, _, cy, _ in items:
+        if "奖励到账" not in t:
+            continue
+        m = re.search(r"奖励到账\D*(\d+)", t)
+        if m:
+            return int(m.group(1))
+        for t2, _, _, cy2, _ in items:
+            m = re.fullmatch(r"\D{0,2}(\d+)", t2.strip())
+            if m and abs(cy2 - cy) <= 0.02 * sh:
+                return int(m.group(1))
+    return None
+
+
+def round_end_message(state, items, sh):
+    reward = read_round_reward(items, sh)
+    lines = [
+        f"【{state.name}】金币低于 {state.min_coins}，已退出，这一轮结束",
+        f"弹窗只给 {state.low_coin_quit} 金币，点了「坚持退出」，脚本停止",
+    ]
+    if reward is not None:
+        lines.append(f"这一轮奖励到账：{reward} 金币")
+    lines += [f"进度：{state.progress_text()}", f"时间：{datetime.now():%Y-%m-%d %H:%M:%S}"]
+    return "\n".join(lines)
+
+
 def run(title, detect_page, handle, state, page_names):
     global live_close_tries
     print(f"🚀 {title}")
@@ -877,7 +1063,10 @@ def run(title, detect_page, handle, state, page_names):
 
             wait = handle(screen, items, page, data, state)
             if wait is None:
-                if not state.finished():
+                if state.low_coin_quit is not None:
+                    # 金币太少主动退出的，是正常结束这一轮，不是出错
+                    notify(round_end_message(state, items, sh), save_snapshot(screen, "round_end"))
+                elif not state.finished():
                     # 次数没做满就停了（弹层被关、广告一直加载不出来等），要人来看一下
                     notify(
                         f"【{state.name}】抖音商城脚本中途停止了\n"

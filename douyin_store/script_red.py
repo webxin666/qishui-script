@@ -76,6 +76,10 @@ def detect_page(items, sw, sh):
     page = common.detect_live_prompt(items, sw, sh)
     if page:
         return page
+    # 广告中途可能弹「再看26s后可领取奖励 继续观看」，拆红包不看金币多少，一律继续
+    page = common.detect_coin_popup(items, sw, sh)
+    if page:
+        return page
     page = common.detect_ad(items, sw, sh)
     if page:
         return page
