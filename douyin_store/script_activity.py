@@ -35,6 +35,10 @@ def detect_page(items, sw, sh):
     page = common.detect_live_prompt(items, sw, sh)
     if page:
         return page
+    # 命中黑名单点了「反馈」弹出的菜单，盖在广告上，要排在广告页前面
+    page = common.detect_feedback_menu(items, sw, sh)
+    if page:
+        return page
     page = common.detect_coin_popup(items, sw, sh)
     if page:
         return page

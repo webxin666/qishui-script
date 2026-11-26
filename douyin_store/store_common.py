@@ -51,9 +51,13 @@ TARGET_ROI = {
     "继续领奖励": {"x": (0.25, 0.75), "y": (0.45, 0.70)},
     "继续观看": {"x": (0.25, 0.75), "y": (0.45, 0.70)},
     "坚持退出": {"x": (0.25, 0.75), "y": (0.50, 0.75)},
+    # 广告顶栏「广告 | 反馈 | 27s后可领奖励 ×」中间那个；右边胶囊变窄时会往右挪到 67% 左右
+    "反馈": {"x": (0.30, 0.78), "y": (0.0, 0.10)},
 }
 # 点击目标：识别出的文字比目标词长 2 个字以上就不算，排除弹窗标题「再看一个视频继续领奖励」这类顺带包含目标词的
-STRICT_TARGETS = {"领取成功", "继续领奖励", "继续观看", "坚持退出"}
+STRICT_TARGETS = {"领取成功", "继续领奖励", "继续观看", "坚持退出", "反馈", "不感兴趣"}
+# 广告画面上出现黑名单的词就点「反馈」→「不感兴趣」；点了这么多次「反馈」都没弹出菜单，这个广告就不点了
+FEEDBACK_TRIES = 3
 # 任务列表里按钮和任务标题算同一行的高度容差（相对屏幕高度）
 ROW_TOL = 0.03
 # 新广告开始后这么多秒内认出的「领取成功」，当成上一个广告还没消失的残影，不计数也不点
@@ -113,6 +117,7 @@ touch_proc = None     # 后台监听触摸屏的 getevent 进程
 COMMON_PAGE_NAMES = {
     "live_prompt": "进直播间提示",
     "coin_popup": "金币弹窗",
+    "feedback_menu": "反馈菜单",
     "reward_done": "广告结束",
     "countdown": "广告播放中",
     "task_list": "任务列表",
@@ -615,10 +620,10 @@ def ocr_discount_cell(screen, cell):
 
 def check_coupon(screen, items, state):
     """每帧广告画面都调：认出折扣券、记下这个广告出现过的文字，再交给 settle_coupon 发通知"""
+    state.ad_texts.update(t for t, _, _, _, _ in items)
     if state.coupon_done:
         return
     sh, sw = screen.shape[:2]
-    state.ad_texts.update(t for t, _, _, _, _ in items)
     if state.coupon is None:
         coupon = find_coupon(items, sw, sh)
         if not coupon:
@@ -680,6 +685,53 @@ def settle_coupon(state):
     notify("\n".join(lines), coupon["shot"])
 
 
+def tap_feedback(screen, items, state):
+    """这个广告的画面上出现过黑名单的词：点顶栏「反馈」，弹出菜单后在 handle_feedback_menu 里点「不感兴趣」。
+    每个广告只做一次；返回 True 表示这一轮点了「反馈」"""
+    if state.feedback_done or not COUPON_BLACKLIST:
+        return False
+    kw, line = match_keywords(COUPON_BLACKLIST, state.ad_texts)
+    if not kw:
+        return False
+    if state.feedback_tries >= FEEDBACK_TRIES:
+        print(f"⚠️ 点了 {FEEDBACK_TRIES} 次「反馈」都没弹出菜单，这个广告不点了")
+        state.feedback_done = True
+        return False
+    sh, sw = screen.shape[:2]
+    hits = find_targets(items, "反馈", sw, sh)
+    if not hits:
+        return False
+    if not state.feedback_tries:
+        print(f"🚫 画面上出现黑名单「{kw}」（{line}），点「反馈」→「不感兴趣」")
+    score, cx, cy, text, _ = hits[0]
+    if tap(screen, "反馈", text, score, int(cx), int(cy), [c[:4] for c in hits]):
+        state.feedback_tries += 1
+        return True
+    return False
+
+
+def detect_feedback_menu(items, sw, sh):
+    """点「反馈」弹出的菜单：「我不想看」下面「不感兴趣」「重复出现」，再下面「举报广告」。
+    菜单后面的广告倒计时还认得出来，所以要排在广告页前面判断"""
+    hits = find_targets(items, "不感兴趣", sw, sh)
+    if hits and any(re.search(r"我不想看|举报广告|重复出现", normalize_text(t)) for t, _, _, _, _ in items):
+        return "feedback_menu", hits
+    return None
+
+
+def handle_feedback_menu(screen, data, state):
+    if state.feedback_tries and not state.feedback_done:
+        score, cx, cy, text, _ = data[0]
+        if tap(screen, "不感兴趣", text, score, int(cx), int(cy), [c[:4] for c in data]):
+            state.feedback_done = True
+            print("🚫 已点「不感兴趣」，接着看广告")
+        return CLICK_COOLDOWN
+    # 不是脚本点开的（人点开后没管，或者误触），按返回键关掉菜单，接着看广告
+    print("· 反馈菜单不是脚本点开的，按返回键关掉")
+    press_back()
+    return CLICK_COOLDOWN
+
+
 # ---------------- 计数 ----------------
 
 class AdState:
@@ -702,6 +754,8 @@ class AdState:
         self.coupon = None        # 当前广告认出的折扣券
         self.low_coin_quit = None  # 因为弹窗金币太少点了「坚持退出」时记下金币数，开始下一个广告就清掉
         self.ad_texts = set()     # 当前广告出现过的所有文字，用来匹配黑白名单
+        self.feedback_tries = 0   # 当前广告点了几次「反馈」（命中黑名单才点）
+        self.feedback_done = False  # 当前广告的「不感兴趣」点过了没有
         self.list_misses = 0
         self.unknown_rounds = 0
         # 最后一个广告看完后，是否也点「领取成功」退出广告再停（线二要回到拆红包页）
@@ -745,6 +799,8 @@ class AdState:
         self.coupon_done = False
         self.coupon = None
         self.ad_texts = set()
+        self.feedback_tries = 0
+        self.feedback_done = False
         self.low_coin_quit = None
         print(f"▶ {'从广告页启动，接着看' if resumed else '开始看'}：{self.progress_text()}")
 
@@ -904,6 +960,9 @@ def handle_common(screen, items, page, data, state):
     if page == "coin_popup":
         return handle_coin_popup(screen, data, state)
 
+    if page == "feedback_menu":
+        return handle_feedback_menu(screen, data, state)
+
     if page == "live_prompt":
         # 福利弹窗可能和进直播间提示同时出现，点「取消」前先查券
         check_coupon(screen, items, state)
@@ -916,8 +975,10 @@ def handle_common(screen, items, page, data, state):
         if not state.counted and time.time() - state.ad_started < MIN_AD_SECONDS:
             print("· 刚进新广告，右上角还是上一个的「领取成功」，先不管")
             return POLL_INTERVAL
-        # 点「领取成功 ×」会把商品卡一起关掉，所以先查折扣券
+        # 点「领取成功 ×」会把商品卡一起关掉，所以先查折扣券；商品标题最后才出现黑名单的词，也赶在关掉前点「不感兴趣」
         check_coupon(screen, items, state)
+        if tap_feedback(screen, items, state):
+            return CLICK_COOLDOWN
         if not state.counted:
             state.counted = True
             state.watched += 1
@@ -934,6 +995,8 @@ def handle_common(screen, items, page, data, state):
 
     if page == "countdown":
         check_coupon(screen, items, state)
+        if tap_feedback(screen, items, state):
+            return CLICK_COOLDOWN
         print(f"· 广告播放中：{data}")
         return COUNTDOWN_POLL
 
