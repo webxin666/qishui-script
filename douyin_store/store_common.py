@@ -1,9 +1,7 @@
-import atexit
 import base64
 import hashlib
 import hmac
 import json
-import threading
 import urllib.request
 import cv2
 import numpy as np
@@ -62,11 +60,9 @@ FEEDBACK_TRIES = 3
 ROW_TOL = 0.03
 # 新广告开始后这么多秒内认出的「领取成功」，当成上一个广告还没消失的残影，不计数也不点
 MIN_AD_SECONDS = 5.0
-# 每连续这么多轮（每轮截一次图）认不出页面，就按一次返回键；中间认出任何页面就从 0 重新数
+# 连续这么多轮（每轮截一次图）认不出页面，就停止脚本并发飞书通知；中间认出任何页面就从 0 重新数
 # 广告刚加载时会闪一两轮认不出，属于正常
-UNKNOWN_BACK_AFTER = 10
-# 连续这么多轮认不出页面（中间按过返回键也没回到认识的页面），发飞书通知
-UNKNOWN_NOTIFY_AFTER = 10
+UNKNOWN_STOP_AFTER = 10
 # 列表页里读不到次数/按钮时最多重试这么多轮
 LIST_TRIES = 3
 # 任务按钮变成「01:50」这种冷却倒计时期间，最多隔这么多秒再截图看一次
@@ -99,8 +95,6 @@ COUPON_Y_MIN = 0.70
 COUPON_MAX_DISCOUNT = None
 # 这么多秒没看完一个广告（冷却倒计时等待不算），就当脚本卡住了，发飞书通知（估：正常一个广告 30 秒左右）
 STUCK_SECONDS = 300
-# 检测到有人用手指操作手机，就暂停自动操作，最后一次触摸后这么多秒再继续
-HUMAN_PAUSE = 30
 # ===========================================
 
 DEBUG_DIR = None      # 由各条线 setup() 设置
@@ -111,8 +105,6 @@ paused_until = {}   # target -> 恢复点击的时间戳
 LIVE_TARGET = "直播间×"
 live_close_tries = 0  # 连续尝试退出直播间的次数
 DRY_RUN = False       # --dry 时只打印要点哪里，不真点
-human_touch_at = 0.0  # 最近一次检测到真手指触摸屏幕的时间
-touch_proc = None     # 后台监听触摸屏的 getevent 进程
 
 COMMON_PAGE_NAMES = {
     "live_prompt": "进直播间提示",
@@ -159,50 +151,6 @@ def screenshot():
         return None
     img = cv2.imdecode(np.frombuffer(result.stdout, np.uint8), cv2.IMREAD_COLOR)
     return img
-
-
-def find_touchscreen():
-    """找触摸屏对应的 /dev/input/eventN：带 ABS_MT_POSITION_X（多点触控坐标）的那个设备"""
-    try:
-        out = adb_command(["shell", "getevent", "-lp"]).stdout
-    except Exception:
-        return None
-    dev = None
-    for line in out.splitlines():
-        m = re.match(r"add device \d+: (\S+)", line)
-        if m:
-            dev = m.group(1)
-        elif "ABS_MT_POSITION_X" in line and dev:
-            return dev
-    return None
-
-
-def watch_touch():
-    """后台线程：盯着触摸屏的原始事件。
-    脚本用 adb input tap 点的不经过触摸屏（真机实测），只有真手指点屏幕才会有事件"""
-    global human_touch_at, touch_proc
-    dev = find_touchscreen()
-    if not dev:
-        print("⚠️ 没找到触摸屏设备，检测不了有没有人在操作手机")
-        return
-    print(f"👀 盯着触摸屏 {dev}：有人用手指操作手机就暂停，最后一次触摸 {HUMAN_PAUSE}s 后继续")
-    while True:
-        try:
-            # 直接读设备的原始字节：cat 读到就转发，不像 getevent 走管道时会攒够一块才输出
-            touch_proc = subprocess.Popen(
-                ["adb", "exec-out", "cat", dev], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            )
-            while touch_proc.stdout.read1(4096):
-                human_touch_at = time.time()
-        except Exception:
-            pass
-        time.sleep(5)  # adb 断开等情况，过一会儿重连
-
-
-@atexit.register
-def stop_watch_touch():
-    if touch_proc and touch_proc.poll() is None:
-        touch_proc.terminate()
 
 
 def press_back():
@@ -487,18 +435,24 @@ def find_coupon_popup(items, sw, sh):
     if not titles:
         return None
     ty = titles[0]
-    # 弹窗里「6.5折」和「折扣券」在同一行，折扣在左边；只送金币、没有折扣券的弹窗不算
+    # 只送金币、没有折扣券的弹窗不算
     labels = [(cx, cy) for t, _, cx, cy, _ in items if "折扣券" in normalize_text(t) and ty < cy <= ty + 0.25 * sh]
     if not labels:
         return None
     lx, ly = labels[0]
-    row = [t for t, _, cx, cy, _ in items if abs(cy - ly) <= 0.02 * sh and cx < lx]
-    # 折扣那一格：「折扣券」左边、同一行。单个大字「7」整图 OCR 常常框不到，裁出来再认就能认出
-    cell = (int(0.12 * sw), int(ly - 0.035 * sh), int(lx - 0.05 * sw), int(ly + 0.035 * sh))
-    # 首单返金币：标题和折扣券之间那一行的数字，如「5000 金币 首单最高可返」
-    coins = [t.strip() for t, _, _, cy, _ in items if ty < cy < ly - 0.01 * sh and re.fullmatch(r"\d{3,6}", t.strip())]
-    return {"source": "福利弹窗", "discount": find_discount(row), "limit": None, "name": None,
-            "coins": coins[0] if coins else None, "cell": cell}
+    # 折扣有两种版式：「6.5 折 | 折扣券」同一行、折扣在左边；或者「7折」写在「折扣券」正上方（两张卡片左右并排）
+    left = [t for t, _, cx, cy, _ in items if abs(cy - ly) <= 0.02 * sh and cx < lx]
+    above = [t for t, _, cx, cy, _ in items if abs(cx - lx) <= 0.08 * sw and ly - 0.05 * sh <= cy < ly]
+    # 单个大字「7」整图 OCR 常常框不到，裁出折扣那一格再认：两种版式各一格
+    cells = [
+        (int(0.12 * sw), int(ly - 0.035 * sh), int(lx - 0.05 * sw), int(ly + 0.035 * sh)),
+        (int(lx - 0.12 * sw), int(ly - 0.06 * sh), int(lx + 0.12 * sw), int(ly - 0.012 * sh)),
+    ]
+    # 首单返金币：标题和折扣券之间的数字，「5000 金币 首单最高可返」里单独的「5000」，或者连着写的「5000金币」
+    coins = [m.group(1) for t, _, _, cy, _ in items
+             if ty < cy < ly - 0.01 * sh and (m := re.fullmatch(r"(\d{3,6})\s*(?:金币)?", t.strip()))]
+    return {"source": "福利弹窗", "discount": find_discount(left) or find_discount(above), "limit": None, "name": None,
+            "coins": coins[0] if coins else None, "cells": cells}
 
 
 def find_coupon(items, sw, sh):
@@ -608,14 +562,17 @@ def bottom_card_name(items, sw, sh):
     return " ".join(re.sub(r"\s*查看详情$", "", t) for _, t in lines[:2]).strip() or None
 
 
-def ocr_discount_cell(screen, cell):
-    """整图没认出折扣数字时，裁出折扣那一格单独 OCR"""
-    x0, y0, x1, y1 = cell
-    crop = screen[max(y0, 0):y1, max(x0, 0):x1]
-    if crop.size == 0:
-        return None
-    result, _ = get_ocr()(crop, use_cls=False)
-    return find_discount([row[1] for row in result or [] if float(row[2]) >= OCR_SCORE])
+def ocr_discount_cell(screen, cells):
+    """整图没认出折扣数字时，把可能写着折扣的几格依次裁出来单独 OCR"""
+    for x0, y0, x1, y1 in cells:
+        crop = screen[max(y0, 0):y1, max(x0, 0):x1]
+        if crop.size == 0:
+            continue
+        result, _ = get_ocr()(crop, use_cls=False)
+        d = find_discount([row[1] for row in result or [] if float(row[2]) >= OCR_SCORE])
+        if d:
+            return d
+    return None
 
 
 def check_coupon(screen, items, state):
@@ -628,8 +585,8 @@ def check_coupon(screen, items, state):
         coupon = find_coupon(items, sw, sh)
         if not coupon:
             return
-        if coupon["discount"] is None and coupon.get("cell"):
-            coupon["discount"] = ocr_discount_cell(screen, coupon["cell"])
+        if coupon["discount"] is None and coupon.get("cells"):
+            coupon["discount"] = ocr_discount_cell(screen, coupon["cells"])
         d = coupon["discount"]
         if COUPON_MAX_DISCOUNT is not None and d is not None and float(d) > COUPON_MAX_DISCOUNT:
             print(f"🎫 折扣券 {d}折，高于 {COUPON_MAX_DISCOUNT}折，不通知")
@@ -763,8 +720,7 @@ class AdState:
         self.last_page = "unknown"
         self.last_progress = time.time()  # 上次有进展（看完一个广告/在等冷却）的时间，用来判断卡住
         self.stuck_notified = False       # 这次卡住是否已经发过通知
-        self.unknown_notified = False     # 这次认不出页面是否已经发过通知，认出页面后清掉
-        self.unknown_total = 0            # 连续认不出的总轮数，按返回键不清零，认出页面才清零
+        self.stop_reason = None           # 脚本自己停下时的原因，写进「中途停止了」的飞书通知
 
     def mark_progress(self):
         self.last_progress = time.time()
@@ -1012,30 +968,12 @@ def handle_common(screen, items, page, data, state):
         return CLICK_COOLDOWN
 
     state.unknown_rounds += 1
-    state.unknown_total += 1
     preview = ocr_preview(items)[:200] or "OCR 无结果"
-    if UNKNOWN_BACK_AFTER == UNKNOWN_NOTIFY_AFTER:
-        rule = f"满 {UNKNOWN_BACK_AFTER} 轮按返回键并发飞书通知"
-    else:
-        rule = f"满 {UNKNOWN_BACK_AFTER} 轮按返回键；连续 {UNKNOWN_NOTIFY_AFTER} 轮认不出发飞书通知"
-    print(f"· 认不出页面（{state.unknown_rounds}/{UNKNOWN_BACK_AFTER}，{rule}）:", preview)
-    # 连续 UNKNOWN_NOTIFY_AFTER 轮都认不出才通知，同一段只发一次
-    if state.unknown_total >= UNKNOWN_NOTIFY_AFTER and not state.unknown_notified:
-        state.unknown_notified = state.stuck_notified = True
-        backs = (state.unknown_total - 1) // UNKNOWN_BACK_AFTER  # 这一轮之前已经按过几次返回键
-        notify(
-            f"【{state.name}】抖音商城脚本认不出当前页面\n"
-            f"连续 {UNKNOWN_NOTIFY_AFTER} 轮没认出页面，"
-            + (f"按过 {backs} 次返回键也没回到认识的页面\n" if backs else "先按返回键试试\n") +
-            f"屏幕上的字：{preview[:80]}\n"
-            f"进度：{state.progress_text()}\n"
-            f"时间：{datetime.now():%Y-%m-%d %H:%M:%S}",
-            save_snapshot(screen, "stuck"),
-        )
-    if state.unknown_rounds >= UNKNOWN_BACK_AFTER:
-        print(f"↩ 连续 {UNKNOWN_BACK_AFTER} 轮认不出页面，按一次返回键")
-        press_back()
-        state.unknown_rounds = 0
+    print(f"· 认不出页面（{state.unknown_rounds}/{UNKNOWN_STOP_AFTER}，满 {UNKNOWN_STOP_AFTER} 轮停止脚本并发飞书通知）:", preview)
+    if state.unknown_rounds >= UNKNOWN_STOP_AFTER:
+        print(f"❌ 连续 {UNKNOWN_STOP_AFTER} 轮认不出页面，停止脚本")
+        state.stop_reason = f"连续 {UNKNOWN_STOP_AFTER} 轮认不出页面\n屏幕上的字：{preview[:80]}"
+        return None
     return POLL_INTERVAL
 
 
@@ -1089,24 +1027,9 @@ def run(title, detect_page, handle, state, page_names):
     print(f"🚀 {title}")
     print(f"   置信度>={OCR_SCORE}  轮询={POLL_INTERVAL}s  倒计时轮询={COUNTDOWN_POLL}s")
     print(f"   点击调试图目录: {DEBUG_DIR}")
-    threading.Thread(target=watch_touch, daemon=True).start()
-    human_paused = False
 
     while True:
         try:
-            # 有人在用手指操作手机：先不截图不点击，也不算卡住，等他放下手机
-            if time.time() - human_touch_at < HUMAN_PAUSE:
-                if not human_paused:
-                    human_paused = True
-                    print(f"✋ 检测到有人在操作手机，暂停自动操作，最后一次触摸 {HUMAN_PAUSE}s 后继续")
-                state.mark_progress()
-                state.unknown_rounds = state.unknown_total = 0
-                time.sleep(1)
-                continue
-            if human_paused:
-                human_paused = False
-                print("▶ 手机没人操作了，继续自动操作")
-
             screen = screenshot()
             if screen is None:
                 print("⚠️ 截图失败，检查 adb 连接")
@@ -1121,8 +1044,7 @@ def run(title, detect_page, handle, state, page_names):
             if page != "live_room":
                 live_close_tries = 0
             if page != "unknown":
-                state.unknown_rounds = state.unknown_total = 0
-                state.unknown_notified = False
+                state.unknown_rounds = 0
 
             wait = handle(screen, items, page, data, state)
             if wait is None:
@@ -1133,6 +1055,7 @@ def run(title, detect_page, handle, state, page_names):
                     # 次数没做满就停了（弹层被关、广告一直加载不出来等），要人来看一下
                     notify(
                         f"【{state.name}】抖音商城脚本中途停止了\n"
+                        + (f"原因：{state.stop_reason}\n" if state.stop_reason else "") +
                         f"停在：{page_names.get(page, page)}\n"
                         f"进度：{state.progress_text()}\n"
                         f"时间：{datetime.now():%Y-%m-%d %H:%M:%S}",
@@ -1171,30 +1094,11 @@ def dry_run(paths, detect_page, handle, make_state, page_names):
         handle(screen, items, page, data, state)
 
 
-def touch_test(seconds=60):
-    """监听一段时间，每次认出手指触摸就打一行"""
-    threading.Thread(target=watch_touch, daemon=True).start()
-    print(f"👆 接下来 {seconds} 秒，用手指点几下手机屏幕（点状态栏或空白处就行）")
-    last, count, end = 0.0, 0, time.time() + seconds
-    while time.time() < end:
-        # 一次触摸会连着来很多事件，隔 1 秒以上才算新的一次
-        if human_touch_at - last > 1.0:
-            count += 1
-            print(f"   ✋ 第 {count} 次：{datetime.now():%H:%M:%S} 检测到手指触摸")
-        if human_touch_at:
-            last = human_touch_at
-        time.sleep(0.1)
-    print(f"结束：{seconds} 秒内检测到 {count} 次触摸" + ("" if count else "，没检测到，检查手机是否连着、屏幕有没有亮"))
-
-
 def main(title, detect_page, handle, make_state, page_names):
     """python 脚本.py 正常跑；python 脚本.py --dry 截图1.png 截图2.png 离线看页面判断；
-    python 脚本.py --notify-test 发一条测试消息，检查飞书机器人配好没有；
-    python 脚本.py --touch-test 监听 60 秒，用手指点手机屏幕，检查能不能认出有人在操作"""
+    python 脚本.py --notify-test 发一条测试消息，检查飞书机器人配好没有"""
     if len(sys.argv) > 1 and sys.argv[1] == "--notify-test":
         notify(f"抖音商城脚本：飞书通知测试\n时间：{datetime.now():%Y-%m-%d %H:%M:%S}", "(测试消息，没有截图)")
-    elif len(sys.argv) > 1 and sys.argv[1] == "--touch-test":
-        touch_test()
     elif len(sys.argv) > 2 and sys.argv[1] == "--dry":
         dry_run(sys.argv[2:], detect_page, handle, make_state, page_names)
     else:
